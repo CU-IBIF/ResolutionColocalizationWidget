@@ -126,17 +126,31 @@ def overlap(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
     return moc, (ab / aa if aa > 0 else float("nan")), (ab / bb if bb > 0 else float("nan"))
 
 
-def manders(a: np.ndarray, b: np.ndarray, ta: float, tb: float) -> tuple[float, float]:
-    """Thresholded Manders' coefficients (Coloc 2's tM1, tM2).
+MANDERS_FORMS = ("above own threshold (Coloc 2)", "all signal (Manders 1993)")
 
-    ``M1 = sum a_i [a_i > Ta and b_i > Tb] / sum a_i [a_i > Ta]``: the fraction of
-    channel 1's signal that lies where channel 2 is present; M2 is the converse.
+
+def manders(a: np.ndarray, b: np.ndarray, ta: float, tb: float,
+            form: str = MANDERS_FORMS[0]) -> tuple[float, float]:
+    """Thresholded Manders' coefficients.
+
+    Numerator, both forms: channel 1's signal in pixels where channel 2 is present
+    (``b > Tb``) *and* channel 1 itself counts (``a > Ta``).
+
+    * ``above own threshold`` (Fiji's Coloc 2 tM1, tM2):
+      ``M1 = sum a_i [a_i > Ta and b_i > Tb] / sum a_i [a_i > Ta]``
+    * ``all signal`` (Manders et al. 1993, with thresholds):
+      ``M1 = sum a_i [a_i > Ta and b_i > Tb] / sum a_i``
+
+    The second is never larger: sub-threshold signal (dim haze, noise) sits in its
+    denominator and never in its numerator. M2 is the converse in each form.
     """
     above_a = a > ta
     above_b = b > tb
     both = above_a & above_b
-    sa = float(a[above_a].sum())
-    sb = float(b[above_b].sum())
+    if form == MANDERS_FORMS[1]:
+        sa, sb = float(a.sum()), float(b.sum())
+    else:
+        sa, sb = float(a[above_a].sum()), float(b[above_b].sum())
     m1 = float(a[both].sum()) / sa if sa > 0 else float("nan")
     m2 = float(b[both].sum()) / sb if sb > 0 else float("nan")
     return m1, m2
@@ -213,16 +227,27 @@ def costes_threshold(a: np.ndarray, b: np.ndarray) -> Thresholds:
         r = pearson(a[below], b[below])
         return r if math.isfinite(r) else -1.0
 
-    if r_below(lo) > 0:
-        # Even the lowest threshold leaves correlation below it: everything correlates.
+    # As Costes defines it: step T *down* from the top and stop at the first T where
+    # the pixels not above both thresholds have r <= 0. r_below need not be monotone,
+    # so a plain bisection over the whole range could land on a lower crossing. A
+    # coarse downward scan finds the first crossing; bisection refines inside it.
+    steps = np.linspace(hi, lo, 65)
+    upper = steps[0]
+    for t in steps[1:]:
+        if r_below(t) <= 0:
+            lower = t
+            break
+        upper = t
+    else:
+        # Correlation survives to the bottom: every pixel is in the correlated population.
         return Thresholds(lo, m * lo + c, "Costes", m, c)
-    for _ in range(22):
-        mid = 0.5 * (lo + hi)
-        if r_below(mid) > 0:
-            hi = mid
+    for _ in range(14):
+        mid = 0.5 * (upper + lower)
+        if r_below(mid) <= 0:
+            lower = mid
         else:
-            lo = mid
-    return Thresholds(hi, m * hi + c, "Costes", m, c)
+            upper = mid
+    return Thresholds(lower, m * lower + c, "Costes", m, c)
 
 
 def thresholds(a: np.ndarray, b: np.ndarray, mode: str, fraction: float = 0.2) -> Thresholds:
@@ -301,7 +326,8 @@ class Coefficients:
 
 
 def coefficients(a: np.ndarray, b: np.ndarray, threshold_mode: str = "Costes", fraction: float = 0.2,
-                 rank: bool = True, fixed: Thresholds | None = None) -> Coefficients:
+                 rank: bool = True, fixed: Thresholds | None = None,
+                 form: str = MANDERS_FORMS[0]) -> Coefficients:
     """Every pixel coefficient. ``fixed`` reuses thresholds chosen elsewhere."""
     a = np.asarray(a, dtype=float).ravel()
     b = np.asarray(b, dtype=float).ravel()
@@ -309,7 +335,7 @@ def coefficients(a: np.ndarray, b: np.ndarray, threshold_mode: str = "Costes", f
         t = fixed
     else:
         t = thresholds(a, b, threshold_mode, fraction) if a.size > 2 else Thresholds(0, 0, threshold_mode)
-    m1, m2 = manders(a, b, t.ta, t.tb)
+    m1, m2 = manders(a, b, t.ta, t.tb, form)
     moc, k1, k2 = overlap(a, b)
     return Coefficients(
         pearson(a, b), spearman(a, b) if rank else float("nan"), icq(a, b), moc, k1, k2, m1, m2, t, a.size,
@@ -340,6 +366,10 @@ def local_maxima(img: np.ndarray, threshold: float, mask: np.ndarray | None = No
 
 @dataclass
 class SpotColoc:
+    p1: np.ndarray  # (row, col) of channel 1's spots, pixels
+    p2: np.ndarray
+    matched1: np.ndarray  # does each ch1 spot have a ch2 spot within d?
+    matched2: np.ndarray
     n1: int
     n2: int
     frac1: float  # fraction of ch1 spots with a ch2 spot within d
@@ -361,30 +391,38 @@ def spot_colocalization(a2d: np.ndarray, b2d: np.ndarray, mask: np.ndarray, ta: 
     area = float(mask.sum()) * pixel_um**2
     d_px = distance_um / pixel_um
 
-    def frac(p, q):
+    def matched(p, q):
         if len(p) == 0:
-            return float("nan")
+            return np.zeros(0, bool)
         pad = np.zeros((len(p), 1))
-        return fraction_within(np.hstack([p, pad]).astype(float), np.hstack([q, np.zeros((len(q), 1))]).astype(float), d_px)
+        return within(np.hstack([p, pad]).astype(float), np.hstack([q, np.zeros((len(q), 1))]).astype(float), d_px)
 
     def chance(q):
         return 1 - math.exp(-len(q) / area * math.pi * distance_um**2) if area > 0 else float("nan")
 
-    return SpotColoc(len(s1), len(s2), frac(s1, s2), frac(s2, s1), chance(s2), chance(s1), distance_um)
+    m1, m2 = matched(s1, s2), matched(s2, s1)
+    f1 = float(m1.mean()) if len(m1) else float("nan")
+    f2 = float(m2.mean()) if len(m2) else float("nan")
+    return SpotColoc(s1, s2, m1, m2, len(s1), len(s2), f1, f2, chance(s2), chance(s1), distance_um)
 
 
 # --- the truth, from the labels -----------------------------------------------------
 
 
 def fraction_within(p: np.ndarray, q: np.ndarray, d: float) -> float:
-    """Fraction of points ``p`` with at least one point of ``q`` within distance d.
+    """Fraction of points ``p`` with at least one point of ``q`` within distance d."""
+    if len(p) == 0:
+        return float("nan")
+    return float(within(p, q, d).mean())
+
+
+def within(p: np.ndarray, q: np.ndarray, d: float) -> np.ndarray:
+    """For each point of ``p``: is a point of ``q`` within distance d?
 
     Exact: a cell list of side d, so only the 27 neighbouring cells are searched.
     """
-    if len(p) == 0:
-        return float("nan")
-    if len(q) == 0:
-        return 0.0
+    if len(p) == 0 or len(q) == 0:
+        return np.zeros(len(p), bool)
     lo = np.minimum(p.min(0), q.min(0)) - d
     kp = np.floor((p - lo) / d).astype(np.int64)
     kq = np.floor((q - lo) / d).astype(np.int64)
@@ -413,7 +451,7 @@ def fraction_within(p: np.ndarray, q: np.ndarray, d: float) -> float:
             j += 1
             live = live & (start + j < end)
             live[live] &= ~found[todo[live]]
-    return float(found.mean())
+    return found
 
 
 def voxel_pearson(p: np.ndarray, q: np.ndarray, voxel: float, volume_voxels: float) -> float:

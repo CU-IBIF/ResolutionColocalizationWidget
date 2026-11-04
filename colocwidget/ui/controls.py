@@ -17,7 +17,7 @@ from PySide6 import QtCore, QtWidgets
 
 from ..physics import optics
 from ..physics.imaging import ROIS, Levers
-from ..physics.metrics import THRESHOLD_MODES
+from ..physics.metrics import MANDERS_FORMS, THRESHOLD_MODES
 from ..physics.scenes import SCENES
 from . import style
 
@@ -222,6 +222,13 @@ class LeverPanel(QtWidgets.QWidget):
         form.addRow("threshold", self.threshold)
         self.fraction = LeverSlider(0, 100, self.levers.threshold_fraction * 100, suffix=" %")
         form.addRow("fixed at", self.fraction)
+        self.manders_form = _combo(MANDERS_FORMS, self.levers.manders_form)
+        self.manders_form.setToolTip(
+            "the denominator of M1 (and M2):\n"
+            "above own threshold (Coloc 2): sum of a over pixels where a > T1\n"
+            "all signal (Manders 1993): sum of a over every pixel in the region"
+        )
+        form.addRow("Manders' over", self.manders_form)
         self.subtract = QtWidgets.QCheckBox("subtract background")
         self.subtract.setChecked(self.levers.subtract_background)
         form.addRow(self.subtract)
@@ -292,6 +299,7 @@ class LeverPanel(QtWidgets.QWidget):
         self.roi.currentTextChanged.connect(lambda t: self._set(roi=t))
         self.threshold.currentTextChanged.connect(lambda t: self._set(threshold=t))
         self.fraction.valueChanged.connect(lambda v: self._set(threshold_fraction=v / 100.0))
+        self.manders_form.currentTextChanged.connect(lambda t: self._set(manders_form=t))
         self.subtract.toggled.connect(lambda on: self._set(subtract_background=on))
         self.truth.valueChanged.connect(lambda v: self._set(truth_nm=v))
         self.realizations.valueChanged.connect(lambda v: self._set(realizations=int(v)))
@@ -381,6 +389,7 @@ class LeverPanel(QtWidgets.QWidget):
         self.roi.setCurrentText(levers.roi)
         self.threshold.setCurrentText(levers.threshold)
         self.fraction.set_value(levers.threshold_fraction * 100)
+        self.manders_form.setCurrentText(levers.manders_form)
         self.subtract.setChecked(levers.subtract_background)
         self.truth.set_value(levers.truth_nm)
         self.realizations.setValue(levers.realizations)

@@ -4,7 +4,7 @@ import pytest
 
 pytest.importorskip("PySide6", reason="the widget needs the 'ui' extra")
 
-from PySide6 import QtWidgets  # noqa: E402
+from PySide6 import QtCore, QtWidgets  # noqa: E402
 
 from colocwidget.physics.imaging import Levers  # noqa: E402
 from colocwidget.physics.presets import PRESETS  # noqa: E402
@@ -146,6 +146,57 @@ def test_display_modes(window):
         w.widget.set_display(merge_name=name)
     w.widget.set_display(show_roi=False)
     assert w.widget.images.recorded.image is not None
+
+
+def test_each_channel_alone_and_the_manders_map(window):
+    w = window()
+    for view in ("channel 1", "channel 2"):
+        w.view.setCurrentText(view)
+        assert "counts" in w.widget.images.product.title
+        img = w.widget.images.recorded.image
+        # Only one channel drawn: green (ch1) or magenta (ch2) in green/magenta.
+        px = [img.pixelColor(x, y) for x in range(0, img.width(), 7) for y in range(0, img.height(), 7)]
+        if view == "channel 1":
+            assert all(c.red() == 0 and c.blue() == 0 for c in px)
+        else:
+            assert all(c.green() == 0 for c in px)
+    w.view.setCurrentText("both channels")
+    assert "nMDP" in w.widget.images.product.title
+
+
+def test_objects_view_draws_the_detected_spots(window):
+    w = window()
+    w.view.setCurrentText("objects (spots)")
+    spots = w.widget.images.recorded.spots
+    sim = w.widget.sim
+    assert len(spots) == sim.spots.n1 + sim.spots.n2 > 0
+    assert sum(m for *_, m in spots) == int(sim.spots.matched1.sum() + sim.spots.matched2.sum())
+    w.view.setCurrentText("both channels")
+    assert w.widget.images.recorded.spots == []
+
+
+def test_apply_thresholds_blanks_what_manders_ignores(window):
+    w = window()
+    before = w.widget.images.recorded.image.copy()
+    w.threshold_images.setChecked(True)
+    after = w.widget.images.recorded.image
+    assert after != before
+    assert "above T1" in w.widget.images.recorded.caption
+    w.threshold_images.setChecked(False)
+    assert "above T1" not in w.widget.images.recorded.caption
+
+
+def test_explanations_wrap_instead_of_scrolling(window):
+    w = window()
+    for tree in (w.widget.coefficients.rows, w.widget.report_panel):
+        assert tree.wordWrap()
+        assert tree.horizontalScrollBarPolicy() == QtCore.Qt.ScrollBarAlwaysOff
+
+
+def test_manders_form_lever(app):
+    panel = LeverPanel(Levers(**FAST))
+    panel.manders_form.setCurrentIndex(1)
+    assert panel.levers.manders_form.startswith("all signal")
 
 
 def test_live_mode_starts_and_stops(window):

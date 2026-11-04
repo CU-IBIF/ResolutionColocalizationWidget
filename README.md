@@ -76,7 +76,7 @@ the resolution that separates compartments.
 | | Spearman's rho | monotone association (Pearson's of the ranks) |
 | | Li's ICQ | fraction of pixels whose deviations share a sign, −0.5…+0.5 |
 | | van Steensel's CCF | r as channel 2 is shifted: peak position and width |
-| co-occurrence | Manders' M1, M2 | fraction of each channel's signal where the other is present (thresholded, as Fiji's Coloc 2) |
+| co-occurrence | Manders' M1, M2 | fraction of each channel's signal where the other is present; thresholded, with the denominator over signal above its own threshold (Fiji's Coloc 2) or over all signal (Manders 1993) |
 | | Manders' overlap (MOC), k1, k2 | not mean-subtracted, so background and uniform signal raise it |
 | thresholds | Costes, Otsu, fixed fraction, none | which pixels count as "present" |
 | significance | Costes randomization | r against channel 1 scrambled in PSF-sized blocks |
@@ -89,6 +89,17 @@ the resolution that separates compartments.
 * **Four image panes**: the labels in the focal plane (the truth), the noise-free
   image, the recorded image, and a map of where Pearson's r comes from (normalized
   mean deviation product). Merges default to green/magenta; white means both.
+* **Show** one channel alone across the top row, or the detected **objects**
+  (spots ringed in their channel's colour; a white dot means a partner lies within
+  one FWHM). With one channel shown, the last pane maps which of its pixels
+  Manders' coefficient counts: bright pixels are in the numerator, slate pixels are
+  in the denominator only.
+* **Apply thresholds** (`Ctrl+T`) blanks every pixel below its channel's
+  threshold (Costes by default), so the images show exactly what M1 and M2 count.
+
+![Channel 1 alone with thresholds applied: the last pane shows the pixels in M1's numerator (bright) and the noise pixels that are only in its denominator (slate)](docs/img/channel1-thresholded.png)
+
+![Objects view: detected spots of both channels ringed, with a white dot where a partner lies within one FWHM; the explanations wrap to the pane](docs/img/objects.png)
 * **The sweep**: every coefficient plotted against the PSF width (or the optical
   section, for cells) with everything else fixed and your photon budget kept.
   Dashed lines mark the truth, and dots mark this frame.
@@ -106,7 +117,7 @@ the resolution that separates compartments.
 | Resolution | microscope (widefield, confocal 1 AU, pixel reassignment, STED), objective, NA, immersion, emission wavelength per channel, STED FWHM, focal plane |
 | Registration | channel 2 shift in x, y, z |
 | Detection | pixel size, peak photons per channel, background, read noise, bleed-through, noise on/off |
-| Analysis | region (whole field, cell, nucleus, cytosol, plasma membrane), threshold method, background subtraction, the distance that counts as "together", repeat frames |
+| Analysis | region (whole field, cell, nucleus, cytosol, plasma membrane), threshold method, Manders' denominator, background subtraction, the distance that counts as "together", repeat frames |
 
 There are 21 presets, numbered by case. Several come in pairs (widefield then STED,
 whole cell then nucleus), so a comparison takes one click.
@@ -125,8 +136,24 @@ python -m colocwidget --list-scenes                        # scenes and their pa
 ```
 
 `--set` accepts any lever and any parameter of the current scene. In the widget,
-`Ctrl+R` records a new frame of the same scene, `Space` streams frames live, and
-`F1` explains the layout.
+`Ctrl+R` records a new frame of the same scene, `Space` streams frames live,
+`Ctrl+T` applies the thresholds to the images, and `F1` explains the layout.
+
+### How Manders' coefficients are checked
+
+`tests/test_metrics.py` checks M1 and M2 four ways:
+
+* against a pixel-by-pixel loop, in both denominator forms;
+* on a specimen with a known answer (half of channel 1's objects carry channel 2,
+  so M1 ≈ 0.5 and M2 ≈ 1) under Costes, Otsu and fixed thresholds;
+* for the classic pitfall: with no threshold, a noise-free blur reaches every
+  pixel, so M1 → 1;
+* for Costes' threshold: it must be the first crossing from the top, where r of
+  the pixels not above both thresholds reaches 0.
+
+On sparse, noisy images, Costes' thresholds often fall inside the background
+noise. Noise pixels then enter the denominators and pull M1 and M2 down. The
+thresholds row of the report flags this.
 
 ### Embedding
 

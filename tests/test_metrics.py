@@ -129,6 +129,8 @@ def test_spot_colocalization_and_chance():
     other[21, 20] = 10.0
     s = M.spot_colocalization(img, other, np.ones_like(img, bool), 0.1, 0.1, 0.1, 0.2)
     assert (s.n1, s.n2) == (2, 1)
+    assert {tuple(x) for x in s.p1} == {(20, 20), (40, 40)}
+    assert sorted(s.matched1.tolist()) == [False, True] and s.matched2.tolist() == [True]
     assert s.frac1 == pytest.approx(0.5) and s.frac2 == pytest.approx(1.0)
     assert 0 < s.chance1 < 0.01
 
@@ -162,3 +164,79 @@ def test_coefficients_bundle_and_fixed_thresholds(rng):
     assert d.thresholds is fixed
     for mode in M.THRESHOLD_MODES:
         assert math.isfinite(M.coefficients(a, a * 0.5 + 0.1, mode).m1)
+
+
+# --- Manders' checks: the arithmetic, the two published forms, and Costes -----------
+
+
+def _brute_manders(a, b, ta, tb, all_signal=False):
+    s1 = s1c = s2 = s2c = 0.0
+    for x, y in zip(a.tolist(), b.tolist()):
+        if x > ta or all_signal:
+            s1 += x
+        if y > tb or all_signal:
+            s2 += y
+        if x > ta and y > tb:
+            s1c += x
+            s2c += y
+    return s1c / s1, s2c / s2
+
+
+@pytest.mark.parametrize("form", M.MANDERS_FORMS)
+def test_manders_matches_a_pixel_by_pixel_loop(rng, form):
+    a = np.clip(rng.normal(5, 4, 3000), 0, None)
+    b = np.clip(0.5 * a + rng.normal(2, 3, 3000), 0, None)
+    ours = M.manders(a, b, 3.0, 4.0, form)
+    assert ours == pytest.approx(_brute_manders(a, b, 3.0, 4.0, all_signal=form == M.MANDERS_FORMS[1]))
+
+
+def test_the_all_signal_form_is_never_larger(rng):
+    a = rng.random(2000) * 10
+    b = rng.random(2000) * 10
+    own = M.manders(a, b, 4, 4, M.MANDERS_FORMS[0])
+    all_ = M.manders(a, b, 4, 4, M.MANDERS_FORMS[1])
+    assert all_[0] <= own[0] and all_[1] <= own[1]
+
+
+def _half_colocalized(rng, noise: bool, n: int = 256):
+    """Half of ch1's objects carry ch2; every ch2 object sits on ch1. M1 ~ 0.5, M2 ~ 1."""
+    yy, xx = np.mgrid[:n, :n]
+    cs = rng.uniform(10, n - 10, (int(60 * (n / 256) ** 2), 2))
+
+    def blobs(c):
+        return sum(np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / 4.5) for cy, cx in c) * 100
+
+    a, b = blobs(cs), blobs(cs[:30])
+    if noise:
+        a, b = rng.poisson(a + 10) - 10.0, rng.poisson(b + 10) - 10.0
+    return np.clip(a, 0, None).ravel(), np.clip(b, 0, None).ravel()
+
+
+@pytest.mark.parametrize("mode", ["Costes", "Otsu", "fixed fraction"])
+def test_thresholded_manders_recovers_a_known_answer(rng, mode):
+    a, b = _half_colocalized(rng, noise=False)
+    c = M.coefficients(a, b, mode)
+    assert c.m1 == pytest.approx(0.5, abs=0.05)
+    assert c.m2 > 0.95
+
+
+def test_unthresholded_manders_counts_every_psf_tail(rng):
+    # The classic pitfall: with T = 0 a noise-free blur reaches every pixel, so M1 = 1.
+    a, b = _half_colocalized(rng, noise=False)
+    assert M.coefficients(a, b, "none").m1 > 0.99
+
+
+def test_costes_takes_the_first_crossing_from_the_top(rng):
+    # 180 x 180 stays under the 40k-pixel subsampling, so the check sees what Costes saw.
+    a, b = _half_colocalized(rng, noise=True, n=180)
+    t = M.costes_threshold(a, b)
+    m, c = t.slope, t.intercept
+
+    def r_below(x):
+        below = ~((a > x) & (b > m * x + c))
+        return M.pearson(a[below], b[below])
+
+    assert r_below(t.ta) <= 0
+    # Every threshold above it still leaves correlated pixels below: it is the first crossing.
+    for x in np.linspace(t.ta * 1.05 + 0.5, a.max() * 0.9, 25):
+        assert r_below(x) > 0

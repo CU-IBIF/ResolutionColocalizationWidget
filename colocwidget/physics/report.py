@@ -16,7 +16,7 @@ import numpy as np
 from . import optics
 from .base import Report, Row, Status
 from .imaging import Simulation
-from .metrics import Coefficients
+from .metrics import MANDERS_FORMS, Coefficients
 
 
 def _f(v: float, digits: int = 2) -> str:
@@ -197,22 +197,41 @@ def coloc_rows(sim: Simulation) -> list[Row]:
     th = me.thresholds
     th_eq = f"T1 = {th.ta:.3g}, T2 = {th.tb:.3g} photons"
     if th.mode == "Costes" and math.isfinite(th.slope):
-        th_eq += (f"; b = {th.slope:.3g} a + {th.intercept:.3g} (orthogonal fit); T lowered until r of the "
-                  "pixels not above both thresholds reaches 0")
+        th_eq += (f"; b = {th.slope:.3g} a + {th.intercept:.3g} (orthogonal fit); T stepped down from the top until "
+                  "r of the pixels not above both thresholds first reaches 0")
+    # Background noise after subtraction, in the same units as the thresholds.
+    sigma = math.sqrt(lv.background + lv.read_noise_e**2) if lv.noise else 0.0
+    in_noise = lv.noise and th.mode != "none" and min(th.ta, th.tb) < 3 * sigma
+    status, remedy = Status.INFO, ""
+    if th.mode == "none":
+        status = Status.WARN
+        remedy = "with no threshold every pixel above 0 counts as 'present': noise and dim haze inflate M1, M2"
+    elif th.note:
+        status = Status.WARN
+    elif in_noise:
+        status = Status.WARN
+        remedy = (f"a threshold below 3 sigma of the background noise ({3 * sigma:.3g} photons) admits noise "
+                  "pixels: they enter the denominators and pull M1, M2 down (and the co-occurrence of two noise "
+                  "pixels pulls them up). More photons, or a less noisy background, lift the threshold clear")
     rows.append(Row(
-        "thresholds", f"{th.mode}" + (f" -- {th.note}" if th.note else ""), th_eq,
-        Status.WARN if th.mode == "none" or th.note else Status.INFO,
-        "with no threshold every pixel above 0 counts as 'present': noise and dim haze inflate M1, M2"
-        if th.mode == "none" else "",
+        "thresholds",
+        f"{th.mode}" + (f" -- {th.note}" if th.note else "") + (" -- inside the background noise" if in_noise else ""),
+        th_eq + (f"; background noise sigma = sqrt(B + read^2) = {sigma:.3g} photons" if lv.noise else ""),
+        status, remedy,
     ))
+    all_signal = lv.manders_form == MANDERS_FORMS[1]
     for key, true, label in (("m1", t.m1, "ch1 near ch2"), ("m2", t.m2, "ch2 near ch1")):
         val, clean = me.get(key), nf.get(key)
         off = abs(val - true) > 0.3 if math.isfinite(val) and math.isfinite(true) else False
+        if key == "m1":
+            eq = "M1 = sum a_i[a_i > T1 and b_i > T2] / " + ("sum a_i" if all_signal else "sum a_i[a_i > T1]")
+        else:
+            eq = "M2 = sum b_i[a_i > T1 and b_i > T2] / " + ("sum b_i" if all_signal else "sum b_i[b_i > T2]")
+        eq += f" ({lv.manders_form}); " + _blame(true, clean, val)
         rows.append(Row(
             Coefficients.LABELS[key],
             f"{_f(val)}  (noise-free {_f(clean)}; molecules {_f(true)}: {label} within {d})",
-            ("M1 = sum a_i[a_i > T1 and b_i > T2] / sum a_i[a_i > T1]" if key == "m1" else
-             "M2 = sum b_i[a_i > T1 and b_i > T2] / sum b_i[b_i > T2]") + "; " + _blame(true, clean, val),
+            eq,
             Status.WARN if off else Status.INFO,
             "Manders' counts co-occurrence in a pixel, and a pixel is ~one PSF wide: two separate "
             "things within it count as colocalized" if off else "",

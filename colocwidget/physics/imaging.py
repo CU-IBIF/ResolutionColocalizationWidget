@@ -71,6 +71,7 @@ class Levers:
     roi: str = "whole field"
     threshold: str = "Costes"
     threshold_fraction: float = 0.2
+    manders_form: str = M.MANDERS_FORMS[0]  # denominator: signal above its own threshold, or all signal
     subtract_background: bool = True
     truth_nm: float = 25.0  # molecular distance that counts as "together"
     realizations: int = 10
@@ -369,17 +370,19 @@ class Simulator:
             notes.append(f"the {roi} region is empty at this focus: measuring the whole field")
             roi, mask = "whole field", masks["whole field"]
 
-        measured = M.coefficients(analysed[0][mask], analysed[1][mask], lv.threshold, lv.threshold_fraction)
+        measured = M.coefficients(analysed[0][mask], analysed[1][mask], lv.threshold, lv.threshold_fraction,
+                                  form=lv.manders_form)
         # The noise-free image is thresholded where the recorded one was. A threshold
         # chosen on a noise-free image falls into the PSF's faint tails, which a real
         # detector never resolves from zero, and counts them all as "present".
         noise_free = M.coefficients(clean[0][mask], clean[1][mask], lv.threshold, lv.threshold_fraction,
-                                    fixed=measured.thresholds)
+                                    fixed=measured.thresholds, form=lv.manders_form)
 
         reps: dict[str, list[float]] = {k: [] for k in M.Coefficients.KEYS}
         for r in range(max(lv.realizations, 0)):
             rec = self.analysed(lv, self.record(lv, optical, 1_000_003 + 7919 * lv.noise_seed + r))
-            c = M.coefficients(rec[0][mask], rec[1][mask], lv.threshold, lv.threshold_fraction, rank=False)
+            c = M.coefficients(rec[0][mask], rec[1][mask], lv.threshold, lv.threshold_fraction, rank=False,
+                               form=lv.manders_form)
             for k in reps:
                 reps[k].append(c.get(k))
         repeats = Repeats({k: np.array(v, float) for k, v in reps.items()})
@@ -416,7 +419,8 @@ class Simulator:
         for comp, roi in ((NUCLEUS, "nucleus"), (CYTOSOL, "cytosol"), (MEMBRANE, "plasma membrane")):
             m = masks[roi]
             t1, t2 = truth.by_compartment.get(comp, (0.0, 0.0))
-            coeffs = (M.coefficients(analysed[0][m], analysed[1][m], lv.threshold, lv.threshold_fraction, rank=False)
+            coeffs = (M.coefficients(analysed[0][m], analysed[1][m], lv.threshold, lv.threshold_fraction, rank=False,
+                                     form=lv.manders_form)
                       if m.sum() >= 16 else None)
             rows.append(CompartmentRow(COMPARTMENTS[comp], t1, t2, float(analysed[0][m].sum()) / tot1,
                                        float(analysed[1][m].sum()) / tot2, coeffs))
@@ -444,7 +448,7 @@ class Simulator:
         key = (self._scene_key, axis, lv.modality, lv.na, lv.medium, lv.focus, lv.emission_nm_1,
                lv.emission_nm_2, lv.sted_fwhm_nm, lv.shift_x_nm, lv.shift_y_nm, lv.shift_z_nm, pixel,
                lv.bleed_through, lv.roi, lv.threshold, lv.threshold_fraction, lv.subtract_background, lv.peak_1,
-               lv.peak_2, lv.background, lv.read_noise_e, lv.noise, points)
+               lv.peak_2, lv.background, lv.read_noise_e, lv.noise, lv.manders_form, points)
         if key == self._sweep_key:
             return self._sweep
         values = {k: np.full(points, np.nan) for k in ("pcc", "m1", "m2", "moc")}
@@ -469,7 +473,8 @@ class Simulator:
             if mask.sum() < 16:
                 mask = masks["whole field"]
             rec = self.analysed(lv, self.record(lv, opt, 424242))
-            c = M.coefficients(rec[0][mask], rec[1][mask], lv.threshold, lv.threshold_fraction, rank=False)
+            c = M.coefficients(rec[0][mask], rec[1][mask], lv.threshold, lv.threshold_fraction, rank=False,
+                               form=lv.manders_form)
             for k in values:
                 values[k][i] = c.get(k)
         self._sweep = Sweep(axis, xs, values, here)

@@ -27,7 +27,7 @@ from ..physics.presets import PRESETS
 from ..physics.report import build_report
 from . import style
 from .controls import LeverPanel
-from .panes import Cytofluorogram, ImageGrid, diverging, merge, outline_of, scale
+from .panes import Cytofluorogram, ImageGrid, WrappingTree, diverging, manders_map, merge, outline_of, scale
 from .plots import Band, Marker, PlotCanvas, PlotSpec, Series
 
 SWEEP_KEYS = ("pcc", "m1", "m2", "moc")
@@ -153,18 +153,14 @@ class CoefficientPanel(QtWidgets.QWidget):
         self.table = QtWidgets.QTreeWidget()
         self.table.setHeaderLabels(["coefficient", "molecules", "noise-free", "recorded", "± frames"])
         self.table.setRootIsDecorated(False)
-        self.table.setColumnWidth(0, 170)
-        for i in (1, 2, 3, 4):
-            self.table.setColumnWidth(i, 74)
+        _fit_columns(self.table)
         self.table.setToolTip(
             "molecules: from the label positions (within the 'together' distance).\n"
             "noise-free: the image the optics and pixels form, before photon counting.\n"
             "recorded: this frame; ± is the spread over repeat frames."
         )
         layout.addWidget(self.table, 2)
-        self.rows = QtWidgets.QTreeWidget()
-        self.rows.setHeaderLabels(["", "value"])
-        self.rows.setColumnWidth(0, 190)
+        self.rows = WrappingTree(["", "value"], first_width=140)
         layout.addWidget(self.rows, 3)
 
     def show_simulation(self, sim: Simulation, report: Report) -> None:
@@ -206,6 +202,17 @@ class CoefficientPanel(QtWidgets.QWidget):
         _fill(self.rows, report.rows)
 
 
+def _fit_columns(tree: QtWidgets.QTreeWidget) -> None:
+    """Name column takes the slack, number columns fit their contents: no sideways scroll."""
+    header = tree.header()
+    header.setStretchLastSection(False)
+    header.setMinimumSectionSize(36)
+    header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+    for i in range(1, tree.columnCount()):
+        header.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeToContents)
+    tree.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+
 def _fill(tree: QtWidgets.QTreeWidget, rows, parent=None) -> None:
     if parent is None:
         tree.clear()
@@ -239,12 +246,11 @@ class CompartmentPanel(QtWidgets.QWidget):
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         self.table = QtWidgets.QTreeWidget()
-        self.table.setHeaderLabels(["compartment", "ch1 labels", "ch1 signal", "ch2 labels", "ch2 signal",
+        self.table.setHeaderLabels(["compartment", "ch1\nlabels", "ch1\nsignal", "ch2\nlabels", "ch2\nsignal",
                                     "r", "M1", "M2"])
         self.table.setRootIsDecorated(False)
-        self.table.setColumnWidth(0, 120)
-        for i in range(1, 8):
-            self.table.setColumnWidth(i, 66)
+        self.table.setWordWrap(True)
+        _fit_columns(self.table)
         layout.addWidget(self.table, 1)
         self.share = PlotCanvas()
         layout.addWidget(self.share, 1)
@@ -287,13 +293,11 @@ class CompartmentPanel(QtWidgets.QWidget):
         ))
 
 
-class ReportPanel(QtWidgets.QTreeWidget):
-    """Every derived number, with its equation."""
+class ReportPanel(WrappingTree):
+    """Every derived number, with its equation, wrapped to the pane."""
 
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setHeaderLabels(["quantity", "value"])
-        self.setColumnWidth(0, 210)
+        super().__init__(["quantity", "value"], first_width=170, parent=parent)
 
     def show_report(self, sections: dict[str, Report]) -> None:
         self.clear()
@@ -324,6 +328,8 @@ class ColocWidget(QtWidgets.QWidget):
         self.noise_seed = 0
         self.merge_name = "green / magenta"
         self.show_roi = True
+        self.view = style.VIEWS[0]
+        self.threshold_images = False
 
         self.levers_panel = LeverPanel(levers)
         scroll = QtWidgets.QScrollArea()
@@ -403,11 +409,16 @@ class ColocWidget(QtWidgets.QWidget):
         else:
             self.live_timer.stop()
 
-    def set_display(self, merge_name: str | None = None, show_roi: bool | None = None) -> None:
+    def set_display(self, merge_name: str | None = None, show_roi: bool | None = None,
+                    view: str | None = None, threshold_images: bool | None = None) -> None:
         if merge_name is not None:
             self.merge_name = merge_name
         if show_roi is not None:
             self.show_roi = show_roi
+        if view is not None:
+            self.view = view
+        if threshold_images is not None:
+            self.threshold_images = threshold_images
         if self.sim is not None:
             self._draw_images(self.sim)
 
@@ -452,6 +463,13 @@ class ColocWidget(QtWidgets.QWidget):
     def _draw_images(self, sim: Simulation) -> None:
         field = sim.extent_um
         outline = outline_of(sim.roi_mask) if self.show_roi and sim.roi_name != "whole field" else None
+        view = self.view
+        # Which channels to draw: both, one, or both dimmed under the detected objects.
+        w1, w2 = {"channel 1": (1.0, 0.0), "channel 2": (0.0, 1.0)}.get(view, (1.0, 1.0))
+        if view == style.VIEWS[3]:
+            w1 = w2 = 0.45
+        name = {"channel 1": "ch1 only", "channel 2": "ch2 only"}.get(view, "")
+        tag = f" · {name}" if name else ""
 
         # The truth: labels in the focal plane, block-summed to <= 256 px for display.
         o1, o2 = sim.object_slice
@@ -468,32 +486,80 @@ class ColocWidget(QtWidgets.QWidget):
         sp = sim.scene
         plane = "" if sp.flat else f" at z = {sim.levers.focus:.1f} µm"
         self.images.object.show_image(
-            merge(scale(o1, 0, hi(o1)), scale(o2, 0, hi(o2)), self.merge_name), sp.field_um,
-            f"{sp.dx_um * k * 1000:.0f} nm bins{plane} · white = both",
+            merge(w1 * scale(o1, 0, hi(o1)), w2 * scale(o2, 0, hi(o2)), self.merge_name), sp.field_um,
+            f"{sp.dx_um * k * 1000:.0f} nm bins{plane}" + (tag or " · white = both"),
         )
-        # Optical and recorded share each channel's display range, so noise looks as big as it is.
+
+        # Thresholds are in background-subtracted photons: the units the coefficients use.
+        th = sim.measured.thresholds
         a_e, b_e = sim.optical
-        ra, rb = float(np.percentile(a_e, 99.5)) or 1.0, float(np.percentile(b_e, 99.5)) or 1.0
-        bg = sim.levers.background
-        self.images.optical.show_image(
-            merge(scale(a_e, 0, ra), scale(b_e, 0, rb), self.merge_name, outline), field,
-            f"FWHM {sim.fwhm_um[0] * 1000:.0f} / {sim.fwhm_um[1] * 1000:.0f} nm · {sim.pixel_um * 1000:.0f} nm px",
-        )
-        r1, r2 = sim.recorded
-        self.images.recorded.show_image(
-            merge(scale(r1, bg, bg + ra), scale(r2, bg, bg + rb), self.merge_name, outline), field,
-            f"peak {sim.levers.peak_1:.0f} / {sim.levers.peak_2:.0f} photons" + (" · noise" if sim.levers.noise else ""),
-        )
         a, b = sim.analysed
+        if self.threshold_images:
+            a_e = np.where(a_e > th.ta, a_e, 0.0)
+            b_e = np.where(b_e > th.tb, b_e, 0.0)
+        # Optical and recorded share each channel's display range, so noise looks as big as it is.
+        ra = float(np.percentile(sim.optical[0], 99.5)) or 1.0
+        rb = float(np.percentile(sim.optical[1], 99.5)) or 1.0
+        spots = self._spots(sim) if view == style.VIEWS[3] else None
+        thr = f" · above T1 {th.ta:.3g} / T2 {th.tb:.3g} ({th.mode})" if self.threshold_images else ""
+        self.images.optical.show_image(
+            merge(w1 * scale(a_e, 0, ra), w2 * scale(b_e, 0, rb), self.merge_name, outline), field,
+            f"FWHM {sim.fwhm_um[0] * 1000:.0f} / {sim.fwhm_um[1] * 1000:.0f} nm · "
+            f"{sim.pixel_um * 1000:.0f} nm px{thr or tag}", spots,
+        )
+        if self.threshold_images:
+            r1 = np.where(a > th.ta, a, 0.0)
+            r2 = np.where(b > th.tb, b, 0.0)
+            lo = 0.0
+        else:
+            r1, r2 = sim.recorded
+            lo = sim.levers.background
+        caption = f"peak {sim.levers.peak_1:.0f} / {sim.levers.peak_2:.0f} photons" + (
+            " · noise" if sim.levers.noise else "")
+        if spots is not None:
+            s = sim.spots
+            caption = (f"{s.n1} ch1 / {s.n2} ch2 spots · dot: partner within {s.distance_um * 1000:.0f} nm")
+        self.images.recorded.show_image(
+            merge(w1 * scale(r1, lo, lo + ra), w2 * scale(r2, lo, lo + rb), self.merge_name, outline), field,
+            caption + (thr or ("" if spots is not None else tag)), spots,
+        )
+
         m = sim.roi_mask
+        if view in ("channel 1", "channel 2"):
+            # One channel: which of its pixels Manders' coefficient counts.
+            ch1 = view == "channel 1"
+            own = (a > th.ta) & m if ch1 else (b > th.tb) & m
+            partner = (b > th.tb) if ch1 else (a > th.ta)
+            colour = style.MERGES[self.merge_name][0 if ch1 else 1]
+            key = "M1" if ch1 else "M2"
+            self.images.product.title = f"what {key} counts"
+            self.images.product.show_image(
+                manders_map(a if ch1 else b, own, partner, colour, outline), field,
+                f"{key} {_fmt(sim.measured.m1 if ch1 else sim.measured.m2)} = bright / (bright + slate), by signal",
+            )
+            return
+        self.images.product.title = "where r comes from (nMDP)"
         prod = np.zeros_like(a)
         if m.sum() > 2:
             prod[m] = nmdp(a[m], b[m])
         lim = float(np.percentile(np.abs(prod[m]), 99.5)) if m.any() else 1.0
         self.images.product.show_image(
             diverging(prod, lim or 1.0, outline), field,
-            "orange: both above / below mean · blue: opposite",
+            "orange: both above / below mean · blue: opposite", spots,
         )
+
+    def _spots(self, sim: Simulation) -> list[tuple[float, float, str, bool]]:
+        """Detected objects as (x um, y um, colour, has a partner) for the panes."""
+        s = sim.spots
+        px = sim.pixel_um
+        c1, c2 = (_hex(c) for c in style.MERGES[self.merge_name])
+        out = [((col + 0.5) * px, (row + 0.5) * px, c1, bool(mt)) for (row, col), mt in zip(s.p1, s.matched1)]
+        out += [((col + 0.5) * px, (row + 0.5) * px, c2, bool(mt)) for (row, col), mt in zip(s.p2, s.matched2)]
+        return out
+
+
+def _hex(rgb: tuple[float, float, float]) -> str:
+    return "#" + "".join(f"{int(round(v * 255)):02x}" for v in rgb)
 
 
 # --- the window ------------------------------------------------------------------
@@ -547,6 +613,26 @@ class ColocWindow(QtWidgets.QMainWindow):
         self.merge.addItems(list(style.MERGES))
         self.merge.currentTextChanged.connect(lambda t: self.widget.set_display(merge_name=t))
         bar.addWidget(self.merge)
+        bar.addWidget(QtWidgets.QLabel("  show: "))
+        self.view = QtWidgets.QComboBox()
+        self.view.addItems(list(style.VIEWS))
+        self.view.setToolTip(
+            "both channels: the merge.\n"
+            "channel 1 / channel 2: that channel alone in every pane; the last pane shows which of its "
+            "pixels Manders' coefficient counts.\n"
+            "objects: the detected spots, ringed in their channel's colour; a white dot means a partner "
+            "spot lies within one FWHM."
+        )
+        self.view.currentTextChanged.connect(lambda t: self.widget.set_display(view=t))
+        bar.addWidget(self.view)
+        self.threshold_images = QtGui.QAction("Apply thresholds", self, checkable=True, checked=False)
+        self.threshold_images.setShortcut("Ctrl+T")
+        self.threshold_images.setToolTip(
+            "show only the pixels above each channel's threshold (Costes by default; the analysis "
+            "lever chooses the method): exactly what Manders' M1 and M2 count"
+        )
+        self.threshold_images.toggled.connect(lambda on: self.widget.set_display(threshold_images=on))
+        bar.addAction(self.threshold_images)
         roi = QtGui.QAction("Show region", self, checkable=True, checked=True)
         roi.setToolTip("outline the region the coefficients are computed in")
         roi.toggled.connect(lambda on: self.widget.set_display(show_roi=on))
@@ -593,6 +679,9 @@ class ColocWindow(QtWidgets.QMainWindow):
             "<p><b>Cases</b>: 1x presets show unresolved collections that look co-labelled; 2x presets show "
             "distribution and morphology effects; 3x presets put labels into a model cell's nucleus, cytosol "
             "and plasma membrane -- see the compartments tab.</p>"
+            "<p><b>Show</b> one channel at a time, or the detected objects. <b>Apply thresholds</b> (Ctrl+T) "
+            "blanks every pixel below its channel's threshold -- what Manders' M1 and M2 count. With one channel "
+            "shown, the last pane maps which of its pixels enter M1's (or M2's) numerator and denominator.</p>"
             "<p><b>New frame</b> (Ctrl+R) re-records the scene; <b>Live</b> (Space) streams frames.</p>"
         )
         box.exec()

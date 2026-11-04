@@ -36,8 +36,10 @@ MERGES = {
     "green / magenta": ((0.0, 1.0, 0.0), (1.0, 0.0, 1.0)),
     "red / green": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
     "cyan / yellow": ((0.0, 0.85, 1.0), (1.0, 0.85, 0.0)),
-    "channel 1 only": ((1.0, 1.0, 1.0), (0.0, 0.0, 0.0)),
-    "channel 2 only": ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
 }
+
+# What the top row shows: both channels merged, one channel alone, or the detected
+# objects (spots) over a dimmed merge.
+VIEWS = ("both channels", "channel 1", "channel 2", "objects (spots)")
 
 BANNER = "background: #3a2f18; color: #d9c45a; padding: 4px; border-radius: 3px;"

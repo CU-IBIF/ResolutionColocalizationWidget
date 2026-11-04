@@ -47,6 +47,26 @@ def diverging(values: np.ndarray, limit: float, outline: np.ndarray | None = Non
     return _rgb_to_qimage(rgb)
 
 
+def manders_map(value: np.ndarray, own: np.ndarray, partner: np.ndarray, colour: tuple[float, float, float],
+                outline: np.ndarray | None = None) -> QtGui.QImage:
+    """Which pixels Manders' coefficient counts, for one channel.
+
+    Bright (the channel's colour, scaled by intensity): above its own threshold and
+    the partner is present -- the numerator. Dim slate: above its own threshold
+    only -- denominator only. Black: not counted.
+    """
+    hi = float(np.percentile(value[own], 99.5)) if own.any() else 1.0
+    t = np.clip(value / (hi or 1.0), 0, 1)[..., None]
+    lit = 0.25 + 0.75 * t
+    rgb = np.zeros(value.shape + (3,))
+    num = own & partner
+    rgb[num] = (lit * np.array(colour))[num]
+    rgb[own & ~partner] = (lit * np.array([0.30, 0.36, 0.48]))[own & ~partner]
+    if outline is not None and outline.any():
+        rgb[outline] = (0.85, 0.64, 0.25)
+    return _rgb_to_qimage(rgb)
+
+
 def outline_of(mask: np.ndarray) -> np.ndarray:
     """Pixels of the mask that touch a pixel outside it."""
     if mask.all():
@@ -66,17 +86,20 @@ class ImagePane(QtWidgets.QWidget):
         self.image: QtGui.QImage | None = None
         self.field_um = 1.0
         self.message = "--"
+        self.spots: list[tuple[float, float, str, bool]] = []  # x um, y um, colour, matched
         self.setMinimumSize(170, 190)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
-    def show_image(self, qimage: QtGui.QImage, field_um: float, caption: str = "") -> None:
+    def show_image(self, qimage: QtGui.QImage, field_um: float, caption: str = "",
+                   spots: list[tuple[float, float, str, bool]] | None = None) -> None:
         self.image = qimage
         self.field_um = field_um
         self.caption = caption
+        self.spots = spots or []
         self.update()
 
     def image_rect(self) -> QtCore.QRectF:
-        top, bottom = 18, 18
+        top, bottom = 18, 32  # room for a caption of two lines
         side = max(min(self.width() - 4, self.height() - top - bottom), 10)
         return QtCore.QRectF((self.width() - side) / 2, top, side, side)
 
@@ -100,6 +123,20 @@ class ImagePane(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)
         p.drawImage(rect, self.image)
         px_per_um = rect.width() / self.field_um
+        if self.spots:
+            # Rings at each detected object; a filled centre when it has a partner within d.
+            p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            for x, y, colour, matched in self.spots:
+                c = QtCore.QPointF(rect.left() + x * px_per_um, rect.top() + y * px_per_um)
+                p.setPen(QtGui.QPen(QtGui.QColor(colour), 1.4))
+                p.setBrush(QtCore.Qt.NoBrush)
+                p.drawEllipse(c, 4.5, 4.5)
+                if matched:
+                    p.setPen(QtCore.Qt.NoPen)
+                    p.setBrush(QtGui.QColor("#ffffff"))
+                    p.drawEllipse(c, 1.8, 1.8)
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.setRenderHint(QtGui.QPainter.Antialiasing, False)
         bar_um = next((b for b in (0.5, 1.0, 2.0, 5.0) if b * px_per_um >= 30), 5.0)
         x1 = rect.right() - 8
         x0 = x1 - bar_um * px_per_um
@@ -109,8 +146,8 @@ class ImagePane(QtWidgets.QWidget):
         p.setPen(QtGui.QColor("#ffffff"))
         p.drawText(QtCore.QRectF(x0 - 40, y - 18, x1 - x0 + 40, 14), QtCore.Qt.AlignRight, f"{bar_um:g} µm")
         p.setPen(QtGui.QColor(style.MUTED))
-        p.drawText(QtCore.QRectF(4, rect.bottom() + 1, self.width() - 8, 16),
-                   QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, self.caption)
+        p.drawText(QtCore.QRectF(4, rect.bottom() + 1, self.width() - 8, 30),
+                   QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop | QtCore.Qt.TextWordWrap, self.caption)
         p.end()
 
 
@@ -220,3 +257,72 @@ class Cytofluorogram(QtWidgets.QWidget):
                    f"channel 2 (0 - {self.bmax:.3g})")
         p.restore()
         p.end()
+
+
+class _WrapDelegate(QtWidgets.QStyledItemDelegate):
+    """Measures each cell's text wrapped to its column's real width.
+
+    A plain tree view asks for a cell's size without telling the delegate how wide
+    the column is, so long text gets one line and an ellipsis. This delegate asks
+    the view for the width, and paints with word wrap on.
+    """
+
+    PAD = 6
+
+    def __init__(self, view: QtWidgets.QTreeView):
+        super().__init__(view)
+        self.view = view
+
+    def _text_width(self, index: QtCore.QModelIndex) -> int:
+        width = self.view.columnWidth(index.column())
+        if index.column() == 0:
+            depth, parent = 0, index.parent()
+            while parent.isValid():
+                depth += 1
+                parent = parent.parent()
+            width -= self.view.indentation() * (depth + (1 if self.view.rootIsDecorated() else 0))
+        return max(width - self.PAD * 2, 30)
+
+    def initStyleOption(self, option, index) -> None:
+        super().initStyleOption(option, index)
+        option.features |= QtWidgets.QStyleOptionViewItem.WrapText
+        option.textElideMode = QtCore.Qt.ElideNone
+
+    def sizeHint(self, option, index) -> QtCore.QSize:
+        text = index.data(QtCore.Qt.DisplayRole)
+        if not text:
+            return super().sizeHint(option, index)
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        width = self._text_width(index)
+        rect = QtGui.QFontMetrics(opt.font).boundingRect(
+            QtCore.QRect(0, 0, width, 100_000), QtCore.Qt.TextWordWrap, str(text))
+        return QtCore.QSize(width, rect.height() + 4)
+
+
+class WrappingTree(QtWidgets.QTreeWidget):
+    """A tree whose text wraps to the pane instead of scrolling sideways.
+
+    Rows are re-measured whenever the pane or a column changes width, so an
+    equation reflows like a paragraph.
+    """
+
+    def __init__(self, labels: list[str], first_width: int = 170, parent=None):
+        super().__init__(parent)
+        self.setHeaderLabels(labels)
+        self.setWordWrap(True)
+        self.setUniformRowHeights(False)
+        self.setTextElideMode(QtCore.Qt.ElideNone)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.setIndentation(12)
+        self.setItemDelegate(_WrapDelegate(self))
+        header = self.header()
+        header.setStretchLastSection(True)
+        header.setMinimumSectionSize(40)
+        self.setColumnWidth(0, first_width)
+        header.sectionResized.connect(lambda *_: self.scheduleDelayedItemsLayout())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.scheduleDelayedItemsLayout()
