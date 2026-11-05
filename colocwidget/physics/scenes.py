@@ -27,6 +27,7 @@ discover them rather than knowing them.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 from typing import Callable
@@ -552,24 +553,72 @@ def _sample_volume(rng, g: CellGeometry, n: int, want_nucleus: bool) -> np.ndarr
     return np.concatenate(out)[:n]
 
 
+# Puncta per compartment: a fixed number of bodies, so the morphology (how many,
+# how big) stays put while the share of a channel in them is varied.
+NUCLEAR_BODIES = 30
+CYTOSOLIC_PUNCTA = 250
+
+
+@dataclass
+class _PunctaPools:
+    """Body centres for one compartment: pool A is channel 1's, pool B channel 2's own."""
+
+    a: np.ndarray
+    b: np.ndarray
+    sigma_um: float
+
+
+def _body_centres(rng, g: CellGeometry, n: int, nucleus: bool, radius_um: float) -> np.ndarray:
+    """Centres far enough inside their compartment that a body of this radius fits."""
+    if nucleus:
+        # Shrink the nucleus by the body radius, so bodies do not poke out of it.
+        inner = dataclasses.replace(
+            g, na_=max(g.na_ - radius_um, 0.3), nb=max(g.nb - radius_um, 0.3), nc=max(g.nc - radius_um, 0.3))
+        return _sample_volume(rng, inner, n, True)
+    return _sample_volume(rng, g, n, False)
+
+
+def _place_in_puncta(rng, n: int, centres: np.ndarray, sigma_um: float) -> np.ndarray:
+    idx = rng.integers(0, len(centres), size=n)
+    return centres[idx] + rng.normal(0, sigma_um, size=(n, 3))
+
+
+def _compartment_labels(rng, g: CellGeometry, n: int, nucleus: bool, punctate: float,
+                        pools: _PunctaPools | None, shared: float, channel: int) -> np.ndarray:
+    """``n`` labels in the nucleus or the cytosol, a fraction ``punctate`` of them in puncta.
+
+    Channel 1's puncta sit on pool A. Each of channel 2's punctate labels sits on
+    pool A with probability ``shared`` (the same bodies as channel 1) and on its own
+    pool B otherwise.
+    """
+    n_punct = int(round(n * punctate)) if pools is not None else 0
+    diffuse = _sample_volume(rng, g, n - n_punct, nucleus)
+    if n_punct == 0:
+        return diffuse
+    if channel == 1:
+        punct = _place_in_puncta(rng, n_punct, pools.a, pools.sigma_um)
+    else:
+        on_a = rng.random(n_punct) < shared
+        punct = np.concatenate([
+            _place_in_puncta(rng, int(on_a.sum()), pools.a, pools.sigma_um),
+            _place_in_puncta(rng, int((~on_a).sum()), pools.b, pools.sigma_um),
+        ])
+    return np.concatenate([diffuse, punct])
+
+
 def _cell_channel(rng, g: CellGeometry, weights: tuple[float, float, float], total: int,
-                  punctate: float) -> Labels:
+                  punctate: tuple[float, float], pools: dict[int, _PunctaPools | None], shared: float,
+                  channel: int) -> Labels:
     w = np.array(weights, dtype=float)
     w = w / w.sum() if w.sum() > 0 else np.full(3, 1 / 3)
     n_nuc, n_cyt, n_mem = (int(round(total * x)) for x in w)
     parts = []
     if n_nuc:
-        parts.append(Labels(_sample_volume(rng, g, n_nuc, True), np.full(n_nuc, NUCLEUS, np.int8)))
+        xyz = _compartment_labels(rng, g, n_nuc, True, punctate[0], pools[NUCLEUS], shared, channel)
+        parts.append(Labels(xyz, np.full(len(xyz), NUCLEUS, np.int8)))
     if n_cyt:
-        # Some of the cytosolic pool can sit in vesicles (puncta of ~25 labels).
-        n_ves = int(round(n_cyt * punctate))
-        diffuse = _sample_volume(rng, g, n_cyt - n_ves, False)
-        if n_ves:
-            centres = _sample_volume(rng, g, max(n_ves // 25, 1), False)
-            idx = rng.integers(0, len(centres), size=n_ves)
-            ves = centres[idx] + rng.normal(0, 0.03, size=(n_ves, 3))
-            diffuse = np.concatenate([diffuse, ves])
-        parts.append(Labels(diffuse, np.full(len(diffuse), CYTOSOL, np.int8)))
+        xyz = _compartment_labels(rng, g, n_cyt, False, punctate[1], pools[CYTOSOL], shared, channel)
+        parts.append(Labels(xyz, np.full(len(xyz), CYTOSOL, np.int8)))
     if n_mem:
         parts.append(Labels(_sample_membrane(rng, g, n_mem), np.full(n_mem, MEMBRANE, np.int8)))
     return Labels.join(parts)
@@ -578,8 +627,24 @@ def _cell_channel(rng, g: CellGeometry, weights: tuple[float, float, float], tot
 def _cell(v: dict, rng) -> ScenePoints:
     g = _cell_geometry(v)
     total = 120_000
-    ch1 = _cell_channel(rng, g, (v["ch1_nucleus"], v["ch1_cytosol"], v["ch1_membrane"]), total, v["punctate"])
-    ch2 = _cell_channel(rng, g, (v["ch2_nucleus"], v["ch2_cytosol"], v["ch2_membrane"]), total, v["punctate"])
+    p1 = (v["ch1_nuc_puncta"], v["ch1_cyto_puncta"])
+    p2 = (v["ch2_nuc_puncta"], v["ch2_cyto_puncta"])
+    # Body positions come from their own generator, and only when some channel has
+    # puncta there: a cell with no puncta is exactly the specimen it was before.
+    pools: dict[int, _PunctaPools | None] = {NUCLEUS: None, CYTOSOL: None}
+    body_rng = rng.spawn(1)[0]
+    for comp, nucleus, count, size_key, i in ((NUCLEUS, True, NUCLEAR_BODIES, "nuclear_body_nm", 0),
+                                              (CYTOSOL, False, CYTOSOLIC_PUNCTA, "cyto_punctum_nm", 1)):
+        if p1[i] > 0 or p2[i] > 0:
+            d = v[size_key] / 1000
+            # Diameter ~ 4 sigma: 95% of a body's labels lie within it.
+            pools[comp] = _PunctaPools(_body_centres(body_rng, g, count, nucleus, d / 2),
+                                       _body_centres(body_rng, g, count, nucleus, d / 2), d / 4)
+    shared = v["shared_puncta"]
+    ch1 = _cell_channel(rng, g, (v["ch1_nucleus"], v["ch1_cytosol"], v["ch1_membrane"]), total, p1, pools,
+                        shared, 1)
+    ch2 = _cell_channel(rng, g, (v["ch2_nucleus"], v["ch2_cytosol"], v["ch2_membrane"]), total, p2, pools,
+                        shared, 2)
     dz = 0.4
     z = np.arange(0.0, g.h + dz, dz)
     return ScenePoints(ch1, ch2, CELL_FIELD_UM, CELL_DX_UM, z, g, g.h * 1000, "cell height")
@@ -598,7 +663,23 @@ CELL = Scene(
         Param("ch2_nucleus", "ch2 in nucleus", default=0.0, **_W),
         Param("ch2_cytosol", "ch2 in cytosol", default=1.0, **_W),
         Param("ch2_membrane", "ch2 on membrane", default=0.0, **_W),
-        Param("punctate", "cytosol in vesicles", default=0.0, help="fraction of each cytosolic pool in puncta", **_W),
+        Param("ch1_nuc_puncta", "ch1 nucleus in puncta", default=0.0,
+              help="fraction of channel 1's nuclear labels in nuclear bodies (speckles, PML bodies, foci); "
+                   "0 = diffuse nucleoplasm", **_W),
+        Param("ch1_cyto_puncta", "ch1 cytosol in puncta", default=0.0,
+              help="fraction of channel 1's cytosolic labels in puncta (vesicles, granules); 0 = diffuse", **_W),
+        Param("ch2_nuc_puncta", "ch2 nucleus in puncta", default=0.0,
+              help="fraction of channel 2's nuclear labels in nuclear bodies; 0 = diffuse", **_W),
+        Param("ch2_cyto_puncta", "ch2 cytosol in puncta", default=0.0,
+              help="fraction of channel 2's cytosolic labels in puncta; 0 = diffuse", **_W),
+        Param("shared_puncta", "puncta shared", default=0.0,
+              help="chance that a channel-2 punctate label sits on one of channel 1's bodies rather than "
+                   "its own: 1 = both channels in the same bodies, 0 = separate bodies in the same "
+                   "compartment", **_W),
+        Param("nuclear_body_nm", "nuclear body size", 100, 2000, 500, " nm", log=True,
+              help=f"diameter of each of the {NUCLEAR_BODIES} nuclear bodies per channel"),
+        Param("cyto_punctum_nm", "cytosolic punctum size", 30, 1000, 120, " nm", log=True,
+              help=f"diameter of each of the {CYTOSOLIC_PUNCTA} cytosolic puncta per channel"),
         Param("cell_length_um", "cell length", 8, 24, 20, " µm", decimals=1),
         Param("cell_width_um", "cell width", 6, 20, 14, " µm", decimals=1),
         Param("cell_height_um", "cell height", 2, 10, 5, " µm", decimals=1,

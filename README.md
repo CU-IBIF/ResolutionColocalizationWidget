@@ -48,8 +48,12 @@ lowering r and moving the cross-correlation peak, and crosstalk raising r.
 
 **3. Model cells and compartments.** The model cell is a 3D adherent cell (a dome on
 the coverslip) with a nucleus, cytosol and plasma membrane. Each channel's labels
-are split among the three compartments in proportions you set, and the cytosolic
-pool can be partly vesicular. The coefficients can be measured over the whole field,
+are split among the three compartments in proportions you set. Each channel's
+nuclear and cytosolic pools can also be partly or wholly punctate: nuclear bodies
+in the nucleus and puncta in the cytosol, with sliders for their sizes. A
+"puncta shared" slider puts channel 2's puncta on the same bodies as channel 1's
+or on separate ones, so two channels can share a compartment without sharing a
+structure (presets 3g and 3h). The coefficients can be measured over the whole field,
 the cell, or one compartment. The **compartments** tab sets each channel's true
 share in each compartment against its apparent share of the recorded signal there,
 and gives r, M1 and M2 per compartment.
@@ -125,7 +129,7 @@ the resolution that separates compartments.
 | Detection | pixel size, peak photons per channel, background, read noise, bleed-through, noise on/off |
 | Analysis | region (whole field, cell, nucleus, cytosol, plasma membrane), threshold method, Manders' denominator, background subtraction, the distance that counts as "together", repeat frames |
 
-There are 21 presets, numbered by case. Several come in pairs (widefield then STED,
+There are 23 presets, numbered by case. Several come in pairs (widefield then STED,
 whole cell then nucleus), so a comparison takes one click.
 
 ## Running it

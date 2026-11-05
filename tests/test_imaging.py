@@ -246,5 +246,48 @@ def test_cell_compartment_sweep_tracks_the_shared_truth(sim):
 
 
 def test_a_fully_vesicular_cytosol_builds(sim):
-    s = sim.run(Levers(scene="Model cell", realizations=0).with_(params={"punctate": 1.0}))
+    s = sim.run(Levers(scene="Model cell", realizations=0).with_(params={"ch1_cytosol": 1.0, "ch1_membrane": 0.0, "ch1_cyto_puncta": 1.0, "ch2_cyto_puncta": 1.0, "ch2_nucleus": 1.0, "ch2_nuc_puncta": 1.0}))
     assert s.truth.n2 > 0
+
+
+# --- puncta in the nucleus and the cytosol ---------------------------------------------
+
+
+def test_nuclear_bodies_separate_vs_shared(sim):
+    separate = run(sim, "3g. Nuclear bodies: same compartment, separate bodies")
+    same = run(sim, "3h. ... the same bodies")
+    assert separate.truth.compartment_overlap() == pytest.approx((1.0, 1.0))
+    assert abs(separate.measured.pcc) < 0.2 and separate.measured.m1 < 0.4
+    assert same.measured.pcc > 0.85 and same.measured.m1 > 0.85
+
+
+def test_puncta_stay_in_their_compartment_and_fractions_hold():
+    from colocwidget.physics.scenes import CELL, CYTOSOL, NUCLEUS, build_scene
+
+    sp, _ = build_scene(CELL.name, {"ch1_nucleus": 0.5, "ch1_cytosol": 0.5, "ch1_membrane": 0.0,
+                                    "ch1_nuc_puncta": 1.0, "ch1_cyto_puncta": 0.5}, 1)
+    comp = sp.ch1.compartment
+    assert (comp == NUCLEUS).mean() == pytest.approx(0.5, abs=0.01)
+    nuc = sp.ch1.xyz[comp == NUCLEUS]
+    assert sp.cell.inside_nucleus(nuc).mean() > 0.99
+    # All-punctate nuclear labels crowd into 30 bodies: far denser locally than diffuse ones.
+    import numpy as np
+    from colocwidget.physics import metrics as M
+
+    diffuse, _ = build_scene(CELL.name, {"ch1_nucleus": 0.5, "ch1_cytosol": 0.5, "ch1_membrane": 0.0}, 1)
+    near = M.fraction_within(nuc[:2000], nuc[2000:12000], 0.03)
+    dnuc = diffuse.ch1.xyz[diffuse.ch1.compartment == NUCLEUS]
+    assert near > 5 * M.fraction_within(dnuc[:2000], dnuc[2000:12000], 0.03)
+    assert (sp.ch1.compartment == CYTOSOL).sum() > 0 and np.isfinite(sp.ch1.xyz).all()
+
+
+def test_no_puncta_leaves_the_specimen_unchanged():
+    # Body positions are drawn only when some channel has puncta, so the presets'
+    # specimens are exactly what they were before puncta existed.
+    import numpy as np
+
+    from colocwidget.physics.scenes import CELL, build_scene
+
+    a, _ = build_scene(CELL.name, None, 1)
+    b, _ = build_scene(CELL.name, {"nuclear_body_nm": 900.0, "shared_puncta": 1.0}, 1)
+    assert np.array_equal(a.ch1.xyz, b.ch1.xyz) and np.array_equal(a.ch2.xyz, b.ch2.xyz)

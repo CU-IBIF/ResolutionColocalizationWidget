@@ -32,6 +32,8 @@ STED = dict(modality="STED", sted_fwhm_nm=50.0, pixel_nm=25.0)
 AIRYSCAN = dict(modality="pixel reassignment (Airyscan-type)", pixel_nm=40.0)
 CONFOCAL = dict(modality="confocal (1 AU)")
 CELL = "Model cell"
+_BODIES = {"ch1_nucleus": 1.0, "ch1_membrane": 0.0, "ch2_nucleus": 1.0, "ch2_cytosol": 0.0,
+           "ch1_nuc_puncta": 0.8, "ch2_nuc_puncta": 0.8}
 
 PRESETS: dict[str, Preset] = {
     p.name: p
@@ -171,6 +173,19 @@ PRESETS: dict[str, Preset] = {
             "Membrane vs cytosol in a confocal section, measured over the whole field: the dark area "
             "outside the cell is 'low in both' and lifts r from ~0 to ~0.4. Set the region to 'cell'.",
             L(CELL, roi="whole field", **CONFOCAL),
+        ),
+        Preset(
+            "3g. Nuclear bodies: same compartment, separate bodies",
+            "Both channels are entirely nuclear, 80% of each in nuclear bodies -- but in different bodies. "
+            "The compartment truth says 100% shared; a confocal section resolves the bodies and finds "
+            "r ~ 0. Drag 'puncta shared' toward 1, or sweep it.",
+            L(CELL, params=_BODIES, roi="nucleus", **CONFOCAL),
+        ),
+        Preset(
+            "3h. ... the same bodies",
+            "The same nucleus with both channels in the same bodies: r and M1/M2 near 1. Only the "
+            "bodies' identity changed, not the compartment.",
+            L(CELL, params={**_BODIES, "shared_puncta": 1.0}, roi="nucleus", **CONFOCAL),
         ),
     )
 }

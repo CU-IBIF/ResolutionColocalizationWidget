@@ -71,10 +71,17 @@ interest. Formulas and references are in `physics/metrics.py`:
 A dome-shaped cell on the coverslip, `(x/a)^2 + (y/b)^2 + (z/h)^2 <= 1, z >= 0`, with an
 ellipsoidal nucleus raised 0.5 µm off the glass. Labels are sampled uniformly:
 
-* in the nucleus volume;
-* in the cytosol volume (cell minus nucleus), with an optional fraction in vesicles
-  (~25 labels within 30 nm);
+* in the nucleus volume, with a per-channel fraction in 30 nuclear bodies;
+* in the cytosol volume (cell minus nucleus), with a per-channel fraction in 250
+  puncta;
 * on the membrane, per unit area across the apical dome and the basal disc.
+
+A body or punctum is a Gaussian cloud of labels whose set diameter is about 4σ.
+Nuclear bodies are kept a radius inside the nucleus. Each compartment has two pools
+of body positions: channel 1 uses pool A, and each of channel 2's punctate labels
+uses pool A with probability "puncta shared" and pool B otherwise. Body positions
+come from a child generator and are drawn only when some channel has puncta, so a
+cell without puncta is the same specimen as before.
 
 Regions of interest are drawn at the focal plane: the cell's cross-section, a rim
 `max(0.4 µm, 1.5 FWHM)` wide for the plasma membrane, the nucleus's cross-section,
