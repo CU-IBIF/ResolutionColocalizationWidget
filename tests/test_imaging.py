@@ -49,9 +49,9 @@ def test_the_resolution_sweep_falls_toward_the_truth(sim):
     lv = PRESETS["1a. Interleaved puncta, widefield"].levers
     sw = sim.sweep(lv, "lateral")
     pcc = sw.values["pcc"]
-    assert sw.axis == "lateral" and np.all(np.diff(sw.x_um) > 0)
+    assert sw.axis == "lateral" and np.all(np.diff(sw.x) > 0) and sw.unit == "nm"
     assert pcc[0] < 0.3 and pcc[-1] > 0.6  # 30 nm vs 1.2 um
-    assert sw.here_um == pytest.approx(lv.fwhm_um(1))
+    assert sw.here == pytest.approx(lv.fwhm_um(1) * 1000)
 
 
 # --- case 2: distribution and morphology ------------------------------------------
@@ -148,9 +148,9 @@ def test_the_empty_background_inflates_whole_field_r(sim):
 def test_the_axial_sweep_ends_at_widefield(sim):
     lv = PRESETS["3a. Cell: membrane vs cytosol, widefield"].levers
     sw = sim.sweep(lv)  # auto: axial for a cell
-    assert sw.axis == "axial" and sw.here_um == sw.x_um[-1]
+    assert sw.axis == "axial" and sw.here == sw.x[-1]
     conf = sim.sweep(PRESETS["3b. ... the same cell, confocal section"].levers)
-    assert conf.here_um < 1.0
+    assert conf.here < 1.0
 
 
 # --- the machinery ------------------------------------------------------------------
@@ -195,3 +195,56 @@ def test_pixel_is_never_finer_than_the_scene_grid(sim):
 def test_impossible_na_is_refused(sim):
     with pytest.raises(ValueError, match="exceeds"):
         sim.run(Levers(na=1.4, medium="air"))
+
+
+# --- sweeping any lever or scene parameter -------------------------------------------
+
+
+def test_every_axis_of_a_flat_scene_sweeps(sim):
+    from colocwidget.physics.imaging import sweep_axes
+
+    lv = Levers()
+    axes = sweep_axes(lv)
+    assert "lever:na" in axes and "param:colabelled" in axes
+    assert "lever:sted_fwhm_nm" not in axes  # only STED has a FWHM of its own
+    assert "lever:threshold_fraction" not in axes  # only for a fixed-fraction threshold
+    for key, spec in axes.items():
+        sw = sim.sweep(lv, key, points=4)
+        assert sw.x[0] == pytest.approx(spec.lo * spec.scale if spec.kind == "lever" else spec.lo)
+        assert np.isfinite(sw.values["pcc"]).any(), key
+        assert sw.here == pytest.approx(spec.current(lv)), key
+
+
+def test_sweeping_the_colabelled_fraction_sweeps_the_truth_too(sim):
+    sw = sim.sweep(Levers(), "param:colabelled", points=5)
+    assert sw.truth is not None
+    assert sw.truth["m1"][0] < 0.25 and sw.truth["m1"][-1] > 0.9
+    assert sw.values["pcc"][-1] > sw.values["pcc"][0] + 0.2
+
+
+def test_a_lever_sweep_leaves_the_truth_alone_and_the_main_view_cached(sim):
+    lv = Levers()
+    sim.run(lv.with_(realizations=0))
+    key = sim._scene_key
+    sw = sim.sweep(lv, "param:cluster_radius_nm", points=3)
+    assert sim._scene_key == key  # scene sweeps run on their own simulator
+    na = sim.sweep(lv, "lever:na", points=4)
+    assert na.truth is None and na.x[-1] <= 1.49
+    assert sim.sweep(lv.with_(medium="water", na=1.2), "lever:na", points=3).x[-1] <= 1.333
+    assert sw.values["pcc"][0] > sw.values["pcc"][-1]  # tight clusters look colocalized
+
+
+def test_bleed_through_is_shown_in_percent(sim):
+    sw = sim.sweep(Levers(bleed_through=0.1), "lever:bleed_through", points=3)
+    assert sw.unit == "%" and sw.x[-1] == pytest.approx(50) and sw.here == pytest.approx(10)
+
+
+def test_cell_compartment_sweep_tracks_the_shared_truth(sim):
+    lv = Levers(scene="Model cell", modality="confocal (1 AU)", roi="cell")
+    sw = sim.sweep(lv, "param:ch2_membrane", points=3)
+    assert sw.truth["shared"][0] == pytest.approx(0.0) and sw.truth["shared"][-1] > 0.4
+
+
+def test_a_fully_vesicular_cytosol_builds(sim):
+    s = sim.run(Levers(scene="Model cell", realizations=0).with_(params={"punctate": 1.0}))
+    assert s.truth.n2 > 0

@@ -130,6 +130,40 @@ def test_sweep_axis_choice(window):
     assert w.widget.sweep.axis == "lateral"
 
 
+def test_a_swept_lever_is_disabled_in_the_left_pane(window):
+    w = window()
+    graphs, panel = w.widget.graphs, w.widget.levers_panel
+    graphs.axis.setCurrentIndex(graphs.axis.findData("lever:pixel_nm"))
+    w.widget.refresh()
+    assert w.widget.sweep.axis == "lever:pixel_nm"
+    assert not panel.pixel.isEnabled() and "x-axis" in panel.pixel.toolTip()
+    assert "pixel size" in graphs.sweep.spec.title
+    graphs.axis.setCurrentIndex(graphs.axis.findData("param:colabelled"))
+    w.widget.refresh()
+    assert panel.pixel.isEnabled() and not panel.pixel.toolTip().startswith("on the plot")
+    assert not panel.param_sliders["colabelled"].isEnabled()
+    assert any(s.label.startswith("truth") for s in graphs.sweep.spec.series)
+
+
+def test_a_scene_axis_falls_back_when_the_scene_changes(window):
+    w = window()
+    graphs, panel = w.widget.graphs, w.widget.levers_panel
+    graphs.axis.setCurrentIndex(graphs.axis.findData("param:colabelled"))
+    w.widget.refresh()
+    w.widget.load_preset("2a. Adjacent filaments 120 nm apart, widefield")
+    assert graphs.axis_key() == "auto"
+    assert graphs.axis.findData("param:separation_nm") >= 0
+    assert all(s.isEnabled() for s in panel.param_sliders.values())
+
+
+def test_sted_fwhm_is_offered_only_for_sted(window):
+    w = window()
+    graphs = w.widget.graphs
+    assert graphs.axis.findData("lever:sted_fwhm_nm") < 0
+    w.widget.load_preset("1b. ... the same field at STED (50 nm)")
+    assert graphs.axis.findData("lever:sted_fwhm_nm") >= 0
+
+
 def test_new_frame_changes_noise_not_signal(window):
     w = window()
     widget = w.widget

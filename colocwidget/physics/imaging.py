@@ -203,6 +203,7 @@ class Simulator:
         self._truth: M.Truth | None = None
         self._sweep_key = None
         self._sweep = None
+        self._sweeper: Simulator | None = None  # its own caches, for sweeps that change the scene
 
     # --- caches ---------------------------------------------------------------
 
@@ -254,9 +255,11 @@ class Simulator:
             out.append(total)
         return out
 
-    def truth(self, lv: Levers) -> M.Truth:
+    def truth(self, lv: Levers, molecular: bool = True) -> M.Truth:
+        """The truth from the labels. ``molecular=False`` skips the distance search
+        (compartment shares only), which a sweep over a cell's geometry needs."""
         sp = self.scene(lv)
-        key = (self._scene_key, lv.truth_nm)
+        key = (self._scene_key, lv.truth_nm, molecular)
         if key != self._truth_key:
             d = lv.truth_nm / 1000
             p, q = sp.ch1.xyz, sp.ch2.xyz
@@ -268,9 +271,11 @@ class Simulator:
                 f1 = float((sp.ch1.compartment == comp).mean()) if len(sp.ch1) else 0.0
                 f2 = float((sp.ch2.compartment == comp).mean()) if len(sp.ch2) else 0.0
                 by_comp[comp] = (f1, f2)
+            nan = float("nan")
             self._truth = M.Truth(
-                d, M.fraction_within(p, q, d), M.fraction_within(q, p, d),
-                M.voxel_pearson(p, q, d, volume), len(p), len(q), by_comp,
+                d, M.fraction_within(p, q, d) if molecular else nan,
+                M.fraction_within(q, p, d) if molecular else nan,
+                M.voxel_pearson(p, q, d, volume) if molecular else nan, len(p), len(q), by_comp,
             )
             self._truth_key = key
         return self._truth
@@ -426,24 +431,83 @@ class Simulator:
                                        float(analysed[1][m].sum()) / tot2, coeffs))
         return rows
 
-    # --- the resolution sweep -------------------------------------------------
+    # --- the sweeps -------------------------------------------------------------
 
-    def sweep(self, lv: Levers, axis: str = "auto", points: int = 11) -> "Sweep":
-        """The coefficients as one kind of resolution changes and nothing else does.
+    def sweep(self, lv: Levers, axis: str = "auto", points: int | None = None) -> "Sweep":
+        """The coefficients as one thing changes and nothing else does.
 
         ``lateral``: the PSF's FWHM, from super-resolution to a low-NA objective,
         with channel 2 keeping its ratio to channel 1. ``axial``: the optical-section
         thickness, from a thin confocal section to widefield (no section). ``auto``
         picks axial for a cell -- where compartments are told apart in z -- and
-        lateral otherwise.
+        lateral otherwise. ``lever:<name>`` sweeps one lever across its range;
+        ``param:<name>`` one parameter of the current scene (see :func:`sweep_axes`).
 
         Each point is recorded with the current photons and a fixed noise
         realization, so the curve is what you would measure; thresholds are chosen
-        per point as the analysis lever says. Cached on everything that changes it.
+        per point as the analysis lever says. When the swept quantity changes the
+        specimen or the definition of "together", the truth is swept too. Cached.
         """
         sp = self.scene(lv)
         if axis == "auto":
             axis = "lateral" if sp.flat else "axial"
+        if axis in ("lateral", "axial"):
+            return self._resolution_sweep(lv, axis, points or 11)
+        spec = sweep_axes(lv).get(axis)
+        if spec is None:
+            raise ValueError(f"cannot sweep {axis!r} for this scene and microscope")
+        sweeps_truth = spec.kind == "param" or spec.name == "truth_nm"
+        # Molecular truth on a cell means a distance search over 240k labels per point:
+        # only worth it when the distance itself is what is swept.
+        molecular = sp.flat or spec.name == "truth_nm"
+        if points is None:
+            # Points that rebuild the scene, or search distances in a cell, cost more.
+            expensive = spec.kind == "param" or (spec.name == "truth_nm" and not sp.flat)
+            points = (6 if not sp.flat else 9) if expensive else 11
+        key = (axis, spec.normalize(lv).with_(noise_seed=0, realizations=0), points)
+        if key == self._sweep_key:
+            return self._sweep
+        xs = np.geomspace(spec.lo, spec.hi, points) if spec.log else np.linspace(spec.lo, spec.hi, points)
+        values = {k: np.full(points, np.nan) for k in ("pcc", "m1", "m2", "moc")}
+        truth = {k: np.full(points, np.nan) for k in ("pcc", "m1", "m2", "shared")} if sweeps_truth else None
+        # A separate simulator, so sweeping a scene parameter does not throw away the
+        # main view's cached scene and FFTs.
+        if self._sweeper is None:
+            self._sweeper = Simulator()
+        sim = self._sweeper
+        for i, x in enumerate(xs):
+            lvx = spec.apply(lv, float(x))
+            try:
+                c = sim._point(lvx)
+            except ValueError:
+                continue
+            for k in values:
+                values[k][i] = c.get(k)
+            if truth is not None:
+                t = sim.truth(lvx, molecular=molecular)
+                truth["pcc"][i], truth["m1"][i], truth["m2"][i] = t.pcc, t.m1, t.m2
+                truth["shared"][i] = t.compartment_overlap()[0] if sim._scene.cell is not None else np.nan
+        self._sweep = Sweep(axis, xs, values, spec.current(lv), spec.label, spec.unit, spec.log, truth)
+        self._sweep_key = key
+        return self._sweep
+
+    def _point(self, lv: Levers) -> M.Coefficients:
+        """One recorded frame's coefficients, with a fixed noise realization."""
+        optics.check_na(lv.na, lv.n_medium)
+        sp = self.scene(lv)
+        pixel = max(lv.pixel_nm / 1000, sp.dx_um)
+        fwhm = (lv.fwhm_um(1), lv.fwhm_um(2))
+        opt = self.optical_pixels(lv, fwhm, pixel)
+        masks = self.masks(sp, lv, opt[0].shape, pixel, fwhm[0])
+        mask = masks.get(lv.roi, masks["whole field"])
+        if mask.sum() < 16:
+            mask = masks["whole field"]
+        rec = self.analysed(lv, self.record(lv, opt, 424242))
+        return M.coefficients(rec[0][mask], rec[1][mask], lv.threshold, lv.threshold_fraction, rank=False,
+                              form=lv.manders_form)
+
+    def _resolution_sweep(self, lv: Levers, axis: str, points: int) -> "Sweep":
+        sp = self.scene(lv)
         pixel = max(lv.pixel_nm / 1000, sp.dx_um)
         key = (self._scene_key, axis, lv.modality, lv.na, lv.medium, lv.focus, lv.emission_nm_1,
                lv.emission_nm_2, lv.sted_fwhm_nm, lv.shift_x_nm, lv.shift_y_nm, lv.shift_z_nm, pixel,
@@ -477,17 +541,109 @@ class Simulator:
                                form=lv.manders_form)
             for k in values:
                 values[k][i] = c.get(k)
-        self._sweep = Sweep(axis, xs, values, here)
+        # Shown in nm (lateral) or um (axial), as the eye reads them.
+        scale = 1000.0 if axis == "lateral" else 1.0
+        label = "lateral FWHM, channel 1" if axis == "lateral" else "optical-section FWHM"
+        self._sweep = Sweep(axis, xs * scale, values, here * scale, label, "nm" if axis == "lateral" else "µm",
+                            True, None)
         self._sweep_key = key
         return self._sweep
 
 
 @dataclass
 class Sweep:
-    axis: str  # lateral (x = FWHM, um) or axial (x = optical section, um; the last point is widefield)
-    x_um: np.ndarray
+    axis: str  # lateral, axial (the last point is widefield), lever:<name> or param:<name>
+    x: np.ndarray  # in display units
     values: dict[str, np.ndarray]
-    here_um: float
+    here: float  # the current setting, in display units
+    label: str = ""
+    unit: str = ""
+    log: bool = True
+    truth: dict[str, np.ndarray] | None = None  # the truth along the sweep, when the sweep changes it
+
+
+# --- what can be swept ------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SweepAxis:
+    """One lever or scene parameter as an x-axis: its range and how to set it."""
+
+    key: str  # lever:<field> or param:<name>
+    label: str
+    lo: float
+    hi: float
+    log: bool = False
+    unit: str = ""
+    scale: float = 1.0  # display = stored x scale (e.g. bleed-through stored as a fraction, shown in %)
+
+    @property
+    def kind(self) -> str:
+        return self.key.split(":", 1)[0]
+
+    @property
+    def name(self) -> str:
+        return self.key.split(":", 1)[1]
+
+    def apply(self, lv: Levers, x: float) -> Levers:
+        v = x / self.scale
+        if self.kind == "param":
+            return lv.with_(params={self.name: v})
+        return lv.with_(**{self.name: v})
+
+    def current(self, lv: Levers) -> float:
+        if self.kind == "param":
+            return lv.params[self.name]
+        if self.name == "focus_um":
+            return lv.focus
+        return getattr(lv, self.name) * self.scale
+
+    def normalize(self, lv: Levers) -> Levers:
+        """The levers with the swept value fixed, so the cache ignores where you are on the axis."""
+        return self.apply(lv, self.lo)
+
+
+# Lever fields that make sense as an x-axis: (label, lo, hi, log, unit, scale).
+LEVER_AXES: dict[str, tuple] = {
+    "na": ("NA", 0.2, 1.49, False, "", 1.0),
+    "emission_nm_1": ("ch1 emission", 400, 800, False, "nm", 1.0),
+    "emission_nm_2": ("ch2 emission", 400, 800, False, "nm", 1.0),
+    "sted_fwhm_nm": ("STED FWHM", 20, 250, True, "nm", 1.0),
+    "focus_um": ("focal plane", 0, 0, False, "µm", 1.0),
+    "shift_x_nm": ("ch2 shift x", -500, 500, False, "nm", 1.0),
+    "shift_y_nm": ("ch2 shift y", -500, 500, False, "nm", 1.0),
+    "shift_z_nm": ("ch2 shift z", -1500, 1500, False, "nm", 1.0),
+    "pixel_nm": ("pixel size", 20, 400, True, "nm", 1.0),
+    "peak_1": ("ch1 peak", 2, 5000, True, "photons", 1.0),
+    "peak_2": ("ch2 peak", 2, 5000, True, "photons", 1.0),
+    "background": ("background", 0, 500, False, "photons", 1.0),
+    "read_noise_e": ("read noise", 0, 10, False, "e-", 1.0),
+    "bleed_through": ("bleed-through", 0, 50, False, "%", 100.0),
+    "threshold_fraction": ("fixed threshold", 0, 100, False, "%", 100.0),
+    "truth_nm": ("'together' distance", 5, 500, True, "nm", 1.0),
+}
+
+
+def sweep_axes(lv: Levers) -> dict[str, SweepAxis]:
+    """Every x-axis available for these levers: the levers that apply, then the scene's parameters."""
+    out: dict[str, SweepAxis] = {}
+    scene = lv.scene_model
+    m = optics.MODALITIES[lv.modality]
+    for name, (label, lo, hi, log, unit, scale) in LEVER_AXES.items():
+        if name == "sted_fwhm_nm" and not m.fixed_fwhm:
+            continue  # only STED has a FWHM of its own
+        if name == "threshold_fraction" and lv.threshold != "fixed fraction":
+            continue
+        if name == "na":
+            hi = min(hi, round(lv.n_medium * 0.99, 2))
+        if name == "focus_um":
+            lo, hi = scene.focus_range
+            if scene.kind == "cell":
+                hi = lv.params["cell_height_um"]
+        out[f"lever:{name}"] = SweepAxis(f"lever:{name}", label, lo, hi, log, unit, scale)
+    for p in scene.params:
+        out[f"param:{p.name}"] = SweepAxis(f"param:{p.name}", p.label, p.lo, p.hi, p.log, p.unit.strip())
+    return out
 
 
 def _deposit(xyz: np.ndarray, n: int, dx: float, z_slices: np.ndarray) -> np.ndarray:

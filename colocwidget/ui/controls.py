@@ -127,6 +127,7 @@ class LeverPanel(QtWidgets.QWidget):
         self.levers = levers or Levers()
         self._updating = False
         self.param_sliders: dict[str, LeverSlider] = {}
+        self.swept: str | None = None  # the sweep axis: its control is on the plot, not here
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
 
@@ -342,8 +343,7 @@ class LeverPanel(QtWidgets.QWidget):
         self.scene_info.setText(scene.description)
         m = optics.MODALITIES[lv.modality]
         self.modality_info.setText(m.note)
-        self.sted.setEnabled(m.fixed_fwhm)
-        self.fraction.setEnabled(lv.threshold == "fixed fraction")
+        self._enable_levers()
         n = lv.n_medium
         self._updating = True
         if lv.na > n:
@@ -362,6 +362,66 @@ class LeverPanel(QtWidgets.QWidget):
         self.resolution_info.setText(
             f"FWHM {f1:.0f} / {f2:.0f} nm (ch1 / ch2) · Nyquist pixel {nyq:.0f} nm · optical section {section}"
         )
+        self._mark_swept()
+
+    # --- the sweep axis -----------------------------------------------------
+
+    def lever_widget(self, key: str) -> QtWidgets.QWidget | None:
+        """The control for a sweep axis key (lever:<field> or param:<name>)."""
+        kind, _, name = key.partition(":")
+        if kind == "param":
+            return self.param_sliders.get(name)
+        if kind != "lever":
+            return None
+        return {
+            "na": self.na, "emission_nm_1": self.lambda1, "emission_nm_2": self.lambda2,
+            "sted_fwhm_nm": self.sted, "focus_um": self.focus, "shift_x_nm": self.shift_x,
+            "shift_y_nm": self.shift_y, "shift_z_nm": self.shift_z, "pixel_nm": self.pixel,
+            "peak_1": self.peak1, "peak_2": self.peak2, "background": self.background,
+            "read_noise_e": self.read, "bleed_through": self.bleed, "threshold_fraction": self.fraction,
+            "truth_nm": self.truth,
+        }.get(name)
+
+    def set_swept(self, key: str | None) -> None:
+        """Hand a lever to the plot: its control is disabled while it is the x-axis.
+
+        Only the controls' state changes; no lever value is touched.
+        """
+        key = key if key and ":" in key else None
+        if key == self.swept:
+            return
+        self.swept = key
+        self._enable_levers()
+        self._mark_swept()
+
+    def _enable_levers(self) -> None:
+        """Every slider enabled, except those another lever turns off."""
+        for w in [*self.param_sliders.values(), self.na, self.lambda1, self.lambda2, self.focus, self.shift_x,
+                  self.shift_y, self.shift_z, self.pixel, self.peak1, self.peak2, self.background, self.read,
+                  self.bleed, self.truth]:
+            w.setEnabled(True)
+        self.sted.setEnabled(optics.MODALITIES[self.levers.modality].fixed_fwhm)
+        self.fraction.setEnabled(self.levers.threshold == "fixed fraction")
+
+    SWEPT_STYLE = "LeverSlider { border-left: 3px solid #d9a441; padding-left: 2px; }"
+
+    def _mark_swept(self) -> None:
+        for w in [*self.param_sliders.values(), self.na, self.lambda1, self.lambda2, self.sted, self.focus,
+                  self.shift_x, self.shift_y, self.shift_z, self.pixel, self.peak1, self.peak2,
+                  self.background, self.read, self.bleed, self.fraction, self.truth]:
+            if w.property("swept"):
+                w.setProperty("swept", False)
+                w.setStyleSheet("")
+                w.setToolTip(w.property("normal_tip") or "")
+        w = self.lever_widget(self.swept) if self.swept else None
+        if w is None:
+            return
+        w.setProperty("normal_tip", w.toolTip())
+        w.setProperty("swept", True)
+        w.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        w.setEnabled(False)
+        w.setStyleSheet(self.SWEPT_STYLE)
+        w.setToolTip("on the plot: this is the sweep's x-axis. Choose another sweep to set it here again.")
 
     def set_levers(self, levers: Levers) -> None:
         """Load a whole set of levers (a preset) into the controls."""

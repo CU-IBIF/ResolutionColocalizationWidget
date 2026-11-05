@@ -102,7 +102,13 @@ the resolution that separates compartments.
 ![Objects view: detected spots of both channels ringed, with a white dot where a partner lies within one FWHM; the explanations wrap to the pane](docs/img/objects.png)
 * **The sweep**: every coefficient plotted against the PSF width (or the optical
   section, for cells) with everything else fixed and your photon budget kept.
-  Dashed lines mark the truth, and dots mark this frame.
+  Dashed lines mark the truth, and dots mark this frame. The **sweep x-axis** menu
+  can put any numeric lever on the axis instead, or any parameter of the current
+  scene (NA, pixel size, background, bleed-through, chromatic shift, the
+  co-labelled fraction, cluster radius, a compartment weight, and so on). While a
+  lever is on the plot, its control in the left pane is disabled and marked. When
+  the sweep changes the specimen, or the distance that counts as "together", the
+  truth is swept too and drawn as a dashed curve.
 * **Cross-correlation** and the **cytofluorogram** (2D histogram, with the Costes
   fit and thresholds).
 * **Coefficients** at all three stages, with the spread over repeat frames. **The

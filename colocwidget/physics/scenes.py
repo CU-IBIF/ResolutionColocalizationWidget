@@ -535,6 +535,8 @@ def _sample_membrane(rng, g: CellGeometry, n: int) -> np.ndarray:
 
 def _sample_volume(rng, g: CellGeometry, n: int, want_nucleus: bool) -> np.ndarray:
     """Uniform labels in the nucleus, or in the cytosol (the cell minus the nucleus)."""
+    if n <= 0:
+        return np.zeros((0, 3))
     if want_nucleus:
         lo = np.array([g.nucleus_centre[0] - g.na_, g.nucleus_centre[1] - g.nb, g.nucleus_centre[2] - g.nc])
         span = 2 * np.array([g.na_, g.nb, g.nc])

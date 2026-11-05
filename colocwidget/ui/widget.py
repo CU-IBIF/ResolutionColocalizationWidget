@@ -21,7 +21,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..physics.base import Report, Status
-from ..physics.imaging import Levers, Simulation, Simulator
+from ..physics.imaging import Levers, Simulation, Simulator, sweep_axes
 from ..physics.metrics import Coefficients, nmdp
 from ..physics.presets import PRESETS
 from ..physics.report import build_report
@@ -44,21 +44,21 @@ class Graphs(QtWidgets.QWidget):
     """Coefficients against resolution, the cross-correlation, the cytofluorogram."""
 
     axisChanged = QtCore.Signal()
-    AXES = {"auto": "auto (lateral; optical section for a cell)", "lateral": "lateral FWHM",
-            "axial": "optical section"}
+    RESOLUTION_AXES = {"auto": "auto: resolution (lateral; optical section for a cell)",
+                       "lateral": "lateral FWHM", "axial": "optical section"}
 
     def __init__(self, parent=None):
         super().__init__(parent)
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("sweep:"))
+        row.addWidget(QtWidgets.QLabel("sweep x-axis:"))
         self.axis = QtWidgets.QComboBox()
-        for key, label in self.AXES.items():
-            self.axis.addItem(label, key)
+        self.axis.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
         self.axis.setToolTip(
-            "lateral: the PSF width, from STED to a low-NA objective.\n"
-            "optical section: from a thin confocal section to widefield, where every plane adds."
+            "what the coefficient plot sweeps, with everything else held where it is.\n"
+            "Resolution: the PSF width, or the optical section from confocal to widefield.\n"
+            "Any lever or scene parameter: its control in the left pane is disabled while it is on the plot."
         )
         row.addWidget(self.axis)
         row.addStretch(1)
@@ -67,23 +67,46 @@ class Graphs(QtWidgets.QWidget):
         outer.addLayout(layout, 1)
         self.sweep = PlotCanvas()
         self.sweep.setToolTip(
-            "every coefficient as one kind of resolution changes and nothing else does, at your photon "
-            "budget. Dashed lines: the truth. Dots: this recorded frame."
+            "every coefficient as one thing changes and nothing else does, at your photon budget. "
+            "Dashed: the truth. Dots: this recorded frame."
         )
         self.ccf = PlotCanvas()
         self.scatter = Cytofluorogram()
         layout.addWidget(self.sweep, 5)
         layout.addWidget(self.ccf, 3)
         layout.addWidget(self.scatter, 3)
+        for key, label in self.RESOLUTION_AXES.items():
+            self.axis.addItem(label, key)
+        self._axes_for = None
         self.axis.currentIndexChanged.connect(lambda _i: self.axisChanged.emit())
 
     def axis_key(self) -> str:
-        return self.axis.currentData()
+        return self.axis.currentData() or "auto"
+
+    def set_axes(self, levers: Levers) -> bool:
+        """Offer the axes these levers allow. Returns True if the chosen axis had to change."""
+        axes = sweep_axes(levers)
+        signature = tuple(axes)
+        if signature == self._axes_for:
+            return False
+        current = self.axis_key()
+        self.axis.blockSignals(True)
+        self.axis.clear()
+        for key, label in self.RESOLUTION_AXES.items():
+            self.axis.addItem(label, key)
+        self.axis.insertSeparator(self.axis.count())
+        for key, spec in axes.items():
+            unit = f" ({spec.unit})" if spec.unit else ""
+            prefix = "scene: " if spec.kind == "param" else ""
+            self.axis.addItem(f"{prefix}{spec.label}{unit}", key)
+        index = self.axis.findData(current)
+        self.axis.setCurrentIndex(max(index, 0))
+        self.axis.blockSignals(False)
+        self._axes_for = signature
+        return index < 0
 
     def show_simulation(self, sim: Simulation, sweep) -> None:
-        lateral = sweep.axis == "lateral"
-        xs = sweep.x_um * (1000 if lateral else 1)
-        here = sweep.here_um * (1000 if lateral else 1)
+        xs, here = sweep.x, sweep.here
         series = []
         for k in SWEEP_KEYS:
             series.append(Series(xs, sweep.values[k], style.COEF_COLORS[k], Coefficients.LABELS[k], 2.5))
@@ -92,31 +115,45 @@ class Graphs(QtWidgets.QWidget):
             series.append(Series(np.array([here]), np.array([rec.get(k)]), style.COEF_COLORS[k], "", 4,
                                  kind="points", hover=False))
         t = sim.truth
-        if sim.scene.cell is not None:
+        cell = sim.scene.cell is not None
+        markers = [Marker(here, "#e6edf3", "you are here")]
+        if sweep.truth is not None:
+            # The swept quantity changes the specimen (or "together"): the truth is a curve.
+            tr = sweep.truth
+            if cell and np.isfinite(tr["shared"]).any():
+                series.append(Series(xs, tr["shared"], style.COEF_COLORS["m1"],
+                                     "truth: ch1 in shared compartments", 1.8, dashed=True))
+            if np.isfinite(tr["m1"]).any():
+                series.append(Series(xs, tr["m1"], style.COEF_COLORS["m1"],
+                                     f"truth: molecular M1 ({t.distance_um * 1000:.0f} nm)", 1.8, dashed=True))
+                series.append(Series(xs, tr["pcc"], style.COEF_COLORS["pcc"], "truth: molecular r", 1.8,
+                                     dashed=True))
+        elif cell:
             share1, _ = t.compartment_overlap()
-            markers = [Marker(share1, style.COEF_COLORS["m1"], "ch1 in shared compartments (truth)",
-                              vertical=False)]
+            markers.append(Marker(share1, style.COEF_COLORS["m1"], "ch1 in shared compartments (truth)",
+                                  vertical=False))
         else:
-            markers = [
+            markers += [
                 Marker(t.pcc, style.COEF_COLORS["pcc"], "molecular r", vertical=False),
                 Marker(t.m1, style.COEF_COLORS["m1"], f"molecular M1 (within {t.distance_um * 1000:.0f} nm)",
                        vertical=False),
             ]
-        markers.insert(0, Marker(here, "#e6edf3", "you are here"))
         bands = []
         sp = sim.scene
-        if lateral:
+        x1 = xs[-1]
+        if sweep.axis == "lateral":
             if sp.feature_nm and xs[0] < sp.feature_nm < xs[-1]:
                 bands.append(Band(sp.feature_nm, xs[-1], style.STATUS_COLORS[Status.WARN], "unresolved"))
-            title, xlabel, unit = "coefficients vs PSF width", "lateral FWHM, channel 1 (nm)", "nm"
-        else:
-            bands.append(Band(xs[-2] * 1.05, xs[-1] * 1.2, style.STATUS_COLORS[Status.WARN], "widefield"))
-            title, xlabel, unit = "coefficients vs optical section", "optical-section FWHM (µm)", "µm"
+        elif sweep.axis == "axial":
+            x1 = xs[-1] * 1.2
+            bands.append(Band(xs[-2] * 1.05, x1, style.STATUS_COLORS[Status.WARN], "widefield"))
+        unit = f" ({sweep.unit})" if sweep.unit else ""
         self.sweep.set_spec(PlotSpec(
-            title=title + " (all else fixed)", xlabel=xlabel, ylabel="coefficient", xlog=True,
-            xrange=(xs[0], xs[-1] * 1.2), yrange=(-1.05, 1.05), series=series, markers=markers, bands=bands,
-            x_unit=unit, legend_left=True,
+            title=f"coefficients vs {sweep.label} (all else fixed)", xlabel=f"{sweep.label}{unit}",
+            ylabel="coefficient", xlog=sweep.log, xrange=(xs[0], x1), yrange=(-1.05, 1.05), series=series,
+            markers=markers, bands=bands, x_unit=sweep.unit, legend_left=True,
         ))
+        here = sim.fwhm_um[0] * 1000  # the CCF's shaded band: one FWHM wide
 
         cx, cy = sim.ccf
         self.ccf.set_spec(PlotSpec(
@@ -426,9 +463,15 @@ class ColocWidget(QtWidgets.QWidget):
 
     def refresh(self) -> None:
         levers = self.levers
+        self.graphs.set_axes(levers)  # the axis falls back to "auto" if it no longer exists
+        self.levers_panel.set_swept(self.graphs.axis_key())
         try:
             sim = self.simulator.run(levers)
-            sweep = self.simulator.sweep(levers, self.graphs.axis_key())
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            try:
+                sweep = self.simulator.sweep(levers, self.graphs.axis_key())
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
         except ValueError as exc:
             self.problem.setText(f"cannot image this: {exc}")
             self.problem.setVisible(True)
@@ -671,8 +714,10 @@ class ColocWindow(QtWidgets.QMainWindow):
             "<p><b>Three stages</b>: every coefficient is computed from the molecules, from the noise-free image "
             "and from the recorded image. Resolution is the gap between the first two; noise the gap between "
             "the last two.</p>"
-            "<p><b>The sweep</b> plots each coefficient against the PSF width with everything else fixed. "
-            "Dashed lines are the molecular truth.</p>"
+            "<p><b>The sweep</b> plots each coefficient against the PSF width -- or against any lever or "
+            "scene parameter you pick as its x-axis -- with everything else fixed. That lever's control is "
+            "disabled in the left pane while it is on the plot. Dashed lines are the truth; when the sweep "
+            "changes the specimen, the truth is a curve too.</p>"
             "<p><b>Correlation vs co-occurrence</b>: Pearson's r asks whether the intensities are proportional; "
             "Manders' M1/M2 ask what fraction of one channel lies where the other is. They answer different "
             "questions, and both describe pixels about one PSF wide.</p>"
